@@ -1,0 +1,23 @@
+[package]
+name = "cursor-sdk-bridge-fetch"
+version = "1.0.31"
+edition = "2021"
+rust-version = "1.82"
+license = "MIT"
+description = "Downloads and installs the cursor-sdk-bridge binary for the cursor-sdk-rs crate"
+repository = "https://github.com/felixLandlord/cursor-sdk-rs"
+keywords = ["cursor", "sdk", "bridge", "installer"]
+categories = ["command-line-utilities", "development-tools"]
+readme = "README.md"
+
+[[bin]]
+name = "cursor-sdk-bridge-fetch"
+path = "src/main.rs"
+
+[dependencies]
+# The heavy half of provisioning lives here, not in the `cursor-sdk-rs` library,
+# so applications that already have a bridge never compile a TLS stack.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "blocking"] }
+flate2 = "1"
+tar = "0.4"
+sha2 = "0.10"

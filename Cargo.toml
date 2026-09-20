@@ -1,0 +1,70 @@
+[workspace]
+members = ["bridge-fetch"]
+
+[package]
+name = "cursor-sdk-rs"
+version = "1.0.31"
+edition = "2021"
+rust-version = "1.82"
+license = "MIT"
+description = "Rust SDK for Cursor agents, built on the cursor-sdk-bridge sdk.v1 protocol"
+repository = "https://github.com/felixLandlord/cursor-sdk-rs"
+keywords = ["cursor", "agent", "sdk", "connect", "protobuf"]
+categories = ["api-bindings", "development-tools"]
+readme = "README.md"
+exclude = ["/.github", "/bridge-fetch"]
+
+[lib]
+name = "cursor_sdk"
+
+[dependencies]
+prost = "0.13"
+prost-types = "0.13"
+bytes = "1"
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+futures-core = "0.3"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+pin-project-lite = "0.2"
+tokio = { version = "1", features = ["process", "io-util", "time", "sync", "rt", "macros", "fs", "net", "signal"] }
+tokio-util = { version = "0.7", features = ["io"] }
+hyper = { version = "1", features = ["client", "server", "http1"] }
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "server", "http1", "tokio"] }
+http-body-util = "0.1"
+tracing = "0.1"
+
+[build-dependencies]
+prost-build = "0.13"
+protox = "0.7"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[features]
+default = []
+
+[dev-dependencies.http-body-util]
+version = "0.1"
+
+[dev-dependencies.hyper]
+version = "1"
+features = ["server", "http1"]
+
+[dev-dependencies.hyper-util]
+version = "0.1"
+features = ["server", "http1", "tokio"]
+
+[dev-dependencies.bytes]
+version = "1"
+
+[dev-dependencies.prost]
+version = "0.13"
+
+[dev-dependencies.base64]
+version = "0.22"
+
+[dev-dependencies.serde_json]
+version = "1"
