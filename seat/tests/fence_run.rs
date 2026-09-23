@@ -1657,6 +1657,8 @@ async fn attach_protected_baseline_only_reports_post_attach_changes() {
     tokio::pin!(run_fut);
     let mut events = Vec::new();
     let mut result = None;
+    let mut run_started = false;
+    let mut post_written = false;
     loop {
         tokio::select! {
             outcome = &mut run_fut, if result.is_none() => {
@@ -1665,7 +1667,7 @@ async fn attach_protected_baseline_only_reports_post_attach_changes() {
             event = rx.recv() => match event {
                 Some(event) => {
                     if matches!(&event.kind, SeatEventKind::RunStarted { .. }) {
-                        fs::write(&tracked_mut, b"post-attach").unwrap();
+                        run_started = true;
                     }
                     events.push(event.clone());
                     if let SeatEventKind::Result(r) = event.kind {
@@ -1674,12 +1676,18 @@ async fn attach_protected_baseline_only_reports_post_attach_changes() {
                 }
                 None => break,
             },
+            _ = tokio::time::sleep(Duration::from_millis(1500)), if run_started && !post_written => {
+                assert_eq!(fence_kind_count(&events, "external"), 0);
+                fs::write(&tracked_mut, b"post-attach").unwrap();
+                post_written = true;
+            },
         }
         if result.is_some() {
             break;
         }
     }
     let result = result.expect("result");
+    assert!(post_written);
     assert_eq!(result.outcome, Outcome::Ok);
     assert_eq!(fence_kind_count(&events, "external"), 1);
     assert!(

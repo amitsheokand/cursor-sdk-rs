@@ -1,5 +1,18 @@
 # RECEIPT — T-seat-fence-attribute
 
+## Review round 2
+
+| Finding | Fix |
+|--------|-----|
+| Porcelain paths vs protected root | `rev-parse --show-toplevel/--show-prefix`; status from toplevel with `:(literal)<prefix><rel>` |
+| Git env | `env_clear()` then PATH, HOME, `LC_ALL=C`, `GIT_OPTIONAL_LOCKS=0` |
+| Timeout / deadlock | Own `Child`, `process_group(0)`, drain stdout/stderr, `kill -9 -<pgid>`, then wait |
+| Post-drive undecided rebaseline | Emit `external`/`undecided` without rebaseline or dedup (self-check retries) |
+| Glob metacharacters in paths | Literal pathspecs (round 2 test `attribute_literal_pathspec_with_glob_chars`) |
+| Attach test timing | Silence across ≥1 debounce window on pre-attach baseline, then post-attach write |
+
+Note: host `git status` (2.55) has no `--no-optional-locks` flag; optional locks suppressed via `GIT_OPTIONAL_LOCKS=0`.
+
 ## Review round 1
 
 | Finding | Fix |
@@ -13,18 +26,11 @@
 | External dedup test timing | Stream open ≥5s / multiple heartbeat windows before finish |
 | Protected escape fixtures | Git repo on primary (`init_protected_fence_git`) for dirty detection |
 
-## Changes (cumulative)
+## Tests (cumulative)
 
-- `seat/src/fence.rs`: `AttributeResult`, `snapshot_and_attribute`, dirty-primary `attribute`, robust `git_status_dirty_rels`
-- `seat/src/run.rs`: `apply_attribute_result`, undecided handling, self-check post-fence, `DriveFence.fence_external_emitted`
-- `seat/PROTOCOL.md`: dirty-primary attribution, undecided, attach baseline
-- `seat/tests/fence_run.rs`: integration + attach/git-failure tests
+Unit: `attribute_escape_when_protected_root_is_subdirectory`, `attribute_owner_edit_in_subdirectory_repo_is_external`, `attribute_literal_pathspec_with_glob_chars` (+ round-1 attribute tests)
 
-## Tests
-
-Unit: `attribute_primary_revert_to_head_while_worktree_clean_is_external`, `attribute_owner_commit_same_bytes_in_primary_is_external`, `attribute_agent_commit_in_worktree_then_copy_is_escape`, `attribute_git_failure_is_undecided`, `attribute_rename_in_primary_is_external` (+ prior attribute tests)
-
-Integration: `protected_root_git_failure_post_drive_emits_undecided`, `attach_protected_baseline_only_reports_post_attach_changes`; updated `protected_root_midrun_external_edit_notices_once`
+Integration: updated `attach_protected_baseline_only_reports_post_attach_changes`
 
 ## Gate (tail)
 

@@ -92,11 +92,12 @@ run failures arrives in P4. Controls arriving after the result are moot
   tick. Changes from the baseline are attributed in one blocking pass (snapshot,
   hash protected/worktree copies, then git). Escape iff the protected file is a
   regular file, its content hash matches the worktree copy, **and** the path is
-  dirty in the protected repo (`git status --porcelain` filter on that relative
-  path). Owner commit/pull/revert/stash (primary clean) is `external`. Git
-  status failure mid-run leaves the path undecided (no event, no rebaseline,
-  retry next tick); post-drive undecided paths emit `external` with
-  `tool: "undecided"` (outcome unchanged). On resume attach, the protected
+  dirty in the protected repo (`git -C <toplevel> status --porcelain` with
+  `:(literal)` pathspecs under `rev-parse --show-prefix`). Owner commit/pull/revert/stash
+  (primary clean) is `external`. Git status failure mid-run leaves the path
+  undecided (no event, no rebaseline, retry next tick); post-drive undecided
+  paths emit `external` with `tool: "undecided"` without rebaseline or dedup
+  (outcome unchanged; self-check may retry). On resume attach, the protected
   baseline is taken at re-attach time — only changes after attach are reported.
   Any
   other change (different content, deletion, symlink, missing worktree file) is

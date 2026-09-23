@@ -845,54 +845,144 @@ fn fence_git_program() -> PathBuf {
 
 const GIT_STATUS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-fn git_status_dirty_rels(root: &Path, rels: &[String]) -> Result<std::collections::HashSet<String>, ()> {
-    use std::collections::HashSet;
+fn git_fresh_command() -> std::process::Command {
+    use std::process::Command;
+    let mut cmd = Command::new(fence_git_program());
+    cmd.env_clear();
+    if let Ok(path) = std::env::var("PATH") {
+        cmd.env("PATH", path);
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        cmd.env("HOME", home);
+    }
+    cmd.env("LC_ALL", "C");
+    cmd.env("GIT_OPTIONAL_LOCKS", "0");
+    cmd
+}
+
+fn run_git(configure: impl FnOnce(&mut std::process::Command)) -> Result<std::process::Output, ()> {
+    use std::io::Read;
     use std::process::{Command, Stdio};
     use std::sync::mpsc;
     use std::thread;
 
-    if rels.is_empty() {
-        return Ok(HashSet::new());
-    }
-    let mut cmd = Command::new(fence_git_program());
-    cmd.arg("-C")
-        .arg(root)
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .env("LC_ALL", "C")
-        .arg("status")
-        .arg("--porcelain=v1")
-        .arg("-z")
-        .arg("--untracked-files=all")
-        .arg("--");
-    for rel in rels {
-        cmd.arg(rel);
-    }
+    let mut cmd = git_fresh_command();
+    configure(&mut cmd);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let child = cmd.spawn().map_err(|_| ())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let mut child = cmd.spawn().map_err(|_| ())?;
     let pid = child.id();
+    let mut stdout = child.stdout.take().ok_or(())?;
+    let mut stderr = child.stderr.take().ok_or(())?;
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
-        let _ = tx.send(child.wait_with_output());
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let _ = stdout.read_to_end(&mut out);
+        let _ = stderr.read_to_end(&mut err);
+        let status = child.wait();
+        let _ = tx.send(status.map(|status| std::process::Output {
+            status,
+            stdout: out,
+            stderr: err,
+        }));
     });
-    let output = match rx.recv_timeout(GIT_STATUS_TIMEOUT) {
-        Ok(Ok(output)) => output,
-        Ok(Err(_)) => return Err(()),
+    match rx.recv_timeout(GIT_STATUS_TIMEOUT) {
+        Ok(Ok(output)) => {
+            if output.status.success() {
+                Ok(output)
+            } else {
+                Err(())
+            }
+        }
+        Ok(Err(_)) => Err(()),
         Err(_) => {
             let _ = Command::new("kill")
                 .arg("-9")
-                .arg(pid.to_string())
+                .arg(format!("-{pid}"))
                 .status();
-            return Err(());
+            let _ = rx.recv_timeout(GIT_STATUS_TIMEOUT);
+            Err(())
         }
-    };
-    if !output.status.success() {
-        return Err(());
     }
-    Ok(parse_git_porcelain_v1_z(&output.stdout)
+}
+
+struct GitRepoLayout {
+    toplevel: PathBuf,
+    prefix: String,
+}
+
+fn git_layout_for_root(root: &Path) -> Result<GitRepoLayout, ()> {
+    let root = root.to_path_buf();
+    let output = run_git(|cmd| {
+        cmd.arg("-C")
+            .arg(&root)
+            .args(["rev-parse", "--show-toplevel", "--show-prefix"]);
+    })?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut lines = text.lines().map(str::trim).filter(|line| !line.is_empty());
+    let toplevel = lines.next().ok_or(())?;
+    let prefix = lines.next().unwrap_or("").to_string();
+    Ok(GitRepoLayout {
+        toplevel: PathBuf::from(toplevel),
+        prefix,
+    })
+}
+
+fn toplevel_relative_path(prefix: &str, rel: &str) -> String {
+    let prefix = prefix.trim_start_matches("./");
+    if prefix.is_empty() {
+        rel.to_string()
+    } else {
+        let prefix = prefix.trim_end_matches('/');
+        format!("{prefix}/{rel}")
+    }
+}
+
+fn literal_git_pathspec(toplevel_rel: &str) -> String {
+    format!(":(literal){toplevel_rel}")
+}
+
+fn git_status_dirty_rels(root: &Path, rels: &[String]) -> Result<std::collections::HashSet<String>, ()> {
+    use std::collections::{HashMap, HashSet};
+
+    if rels.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let layout = git_layout_for_root(root)?;
+    let mut rel_to_top: HashMap<String, String> = HashMap::new();
+    for rel in rels {
+        rel_to_top.insert(rel.clone(), toplevel_relative_path(&layout.prefix, rel));
+    }
+    let pathspecs: Vec<String> = rel_to_top
+        .values()
+        .map(|top| literal_git_pathspec(top))
+        .collect();
+    let toplevel = layout.toplevel.clone();
+    let output = run_git(|cmd| {
+        cmd.arg("-C")
+            .arg(&toplevel)
+            .arg("status")
+            .arg("--porcelain=v1")
+            .arg("-z")
+            .arg("--untracked-files=all")
+            .arg("--")
+            .args(&pathspecs);
+    })?;
+    let dirty_top: HashSet<String> = parse_git_porcelain_v1_z(&output.stdout)
         .into_iter()
-        .collect())
+        .collect();
+    let mut dirty_rels = HashSet::new();
+    for (rel, top) in rel_to_top {
+        if dirty_top.contains(&top) {
+            dirty_rels.insert(rel);
+        }
+    }
+    Ok(dirty_rels)
 }
 
 /// Snapshot fence paths under protected roots, diff against `before`, classify in one blocking pass.
@@ -1382,6 +1472,83 @@ mod tests {
         assert!(out.escapes.is_empty());
         assert!(out.external.is_empty());
         assert_eq!(out.undecided, vec![root.join("f.txt")]);
+    }
+
+    #[test]
+    fn attribute_escape_when_protected_root_is_subdirectory() {
+        let parent = unique_temp("attr-nested-parent");
+        let root = parent.join("main");
+        fs::create_dir_all(&root).unwrap();
+        init_git(&parent);
+        fs::write(root.join("f.txt"), b"old").unwrap();
+        Command::new("git")
+            .args(["add", "main/f.txt"])
+            .current_dir(&parent)
+            .output()
+            .expect("git add");
+        Command::new("git")
+            .args(["commit", "-m", "base"])
+            .current_dir(&parent)
+            .output()
+            .expect("git commit");
+        let wt = unique_temp("attr-nested-wt");
+        fs::write(wt.join("f.txt"), b"agent").unwrap();
+        let roots = vec![root.clone()];
+        let before = snapshot(&roots, &["f.txt".into()], &wt);
+        fs::write(root.join("f.txt"), b"agent").unwrap();
+        let after = snapshot(&roots, &["f.txt".into()], &wt);
+        let delta = changed(&before, &after);
+        let out = attribute(&delta, &after, &roots, &wt);
+        assert_eq!(out.external, Vec::<PathBuf>::new());
+        assert_eq!(out.escapes, vec![root.join("f.txt")]);
+    }
+
+    #[test]
+    fn attribute_owner_edit_in_subdirectory_repo_is_external() {
+        let parent = unique_temp("attr-nested-owner");
+        let root = parent.join("main");
+        fs::create_dir_all(&root).unwrap();
+        init_git(&parent);
+        fs::write(root.join("f.txt"), b"head").unwrap();
+        Command::new("git")
+            .args(["add", "main/f.txt"])
+            .current_dir(&parent)
+            .output()
+            .expect("git add");
+        Command::new("git")
+            .args(["commit", "-m", "base"])
+            .current_dir(&parent)
+            .output()
+            .expect("git commit");
+        let wt = unique_temp("attr-nested-wt-owner");
+        fs::write(wt.join("f.txt"), b"head").unwrap();
+        let roots = vec![root.clone()];
+        let before = snapshot(&roots, &["f.txt".into()], &wt);
+        fs::write(root.join("f.txt"), b"owner-edit").unwrap();
+        let after = snapshot(&roots, &["f.txt".into()], &wt);
+        let delta = changed(&before, &after);
+        let out = attribute(&delta, &after, &roots, &wt);
+        assert!(out.escapes.is_empty());
+        assert_eq!(out.external, vec![root.join("f.txt")]);
+    }
+
+    #[test]
+    fn attribute_literal_pathspec_with_glob_chars() {
+        let wt = unique_temp("attr-wt-glob");
+        let root = unique_temp("attr-root-glob");
+        let name = "weird*[op].txt";
+        init_git(&root);
+        fs::write(wt.join(name), b"agent").unwrap();
+        fs::write(root.join(name), b"old").unwrap();
+        git_commit_all(&root, "base");
+        let roots = vec![root.clone()];
+        let before = snapshot(&roots, &[name.into()], &wt);
+        fs::write(root.join(name), b"agent").unwrap();
+        let after = snapshot(&roots, &[name.into()], &wt);
+        let delta = changed(&before, &after);
+        let out = attribute(&delta, &after, &roots, &wt);
+        assert_eq!(out.external, Vec::<PathBuf>::new());
+        assert_eq!(out.escapes, vec![root.join(name)]);
     }
 
     #[test]

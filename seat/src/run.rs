@@ -1289,13 +1289,10 @@ fn apply_attribute_result(
 ) -> Vec<PathBuf> {
     if let Some(base) = baseline {
         rebaseline_entries(base, after, &classified.external);
-        if fail_open_undecided {
-            rebaseline_entries(base, after, &classified.undecided);
-        }
     }
     emit_fence_external(&classified.external, "", emitted, emit);
     if fail_open_undecided {
-        emit_fence_external(&classified.undecided, "undecided", emitted, emit);
+        emit_fence_external_no_dedup(&classified.undecided, "undecided", emit);
     }
     classified.escapes
 }
@@ -1527,6 +1524,20 @@ fn emit_fence_external(
                 tool: tool.to_string(),
             });
         }
+    }
+}
+
+fn emit_fence_external_no_dedup(
+    paths: &[PathBuf],
+    tool: &str,
+    emit: &mut dyn FnMut(SeatEventKind),
+) {
+    for path in paths {
+        emit(SeatEventKind::Fence {
+            kind: "external".to_string(),
+            path: path.display().to_string(),
+            tool: tool.to_string(),
+        });
     }
 }
 
