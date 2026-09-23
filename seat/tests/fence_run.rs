@@ -398,8 +398,15 @@ async fn out_of_fence_git_drift_gets_one_correction_then_fails() {
     );
 
     let req = fenced_request(cwd, vec!["in_fence.txt".into()], vec![]);
-    let (_, result) = collect(&bridge, req).await;
+    let (events, result) = collect(&bridge, req).await;
 
+    assert!(
+        events.iter().any(|event| matches!(
+            &event.kind,
+            SeatEventKind::Fence { kind, path, .. }
+                if kind == "drift" && path == "outside.txt"
+        ))
+    );
     assert_eq!(bridge.call_count("SdkAgentService/Send"), 2);
     assert_eq!(result.outcome, Outcome::Failed);
     assert_eq!(result.status, "fence_drift");

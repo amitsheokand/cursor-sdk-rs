@@ -247,86 +247,93 @@ fn lexically_normalize(path: &Path) -> PathBuf {
     prefix
 }
 
-fn canonicalize_existing_prefix(path: &Path) -> PathBuf {
-    let path = lexically_normalize(path);
-    if path.as_os_str().is_empty() {
-        return path;
-    }
-    let mut suffix = Vec::new();
-    let mut current = path.clone();
-    loop {
-        if let Ok(canon) = std::fs::canonicalize(&current) {
-            let mut out = canon;
-            for part in suffix.iter().rev() {
-                out.push(part);
+fn append_lexical(mut base: PathBuf, comps: &[Component]) -> PathBuf {
+    for comp in comps {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                base.pop();
             }
-            return expand_symlinks_along_path(&out);
-        }
-        match current.file_name() {
-            Some(name) => {
-                suffix.push(name.to_os_string());
-                if !current.pop() {
-                    return expand_symlinks_along_path(&path);
-                }
-            }
-            None => return expand_symlinks_along_path(&path),
+            Component::Normal(name) => base.push(name),
+            Component::Prefix(_) | Component::RootDir => base.push(comp.as_os_str()),
         }
     }
+    base
 }
 
-fn expand_symlinks_along_path(path: &Path) -> PathBuf {
-    if !path.is_absolute() {
-        return path.to_path_buf();
+fn canonicalize_component(path: &Path) -> PathBuf {
+    if path
+        .symlink_metadata()
+        .map(|meta| meta.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        if let Ok(link) = std::fs::read_link(path) {
+            let resolved = if link.is_absolute() {
+                lexically_normalize(&link)
+            } else {
+                lexically_normalize(
+                    &path
+                        .parent()
+                        .unwrap_or(Path::new("/"))
+                        .join(link),
+                )
+            };
+            if resolved.exists() {
+                return std::fs::canonicalize(&resolved).unwrap_or(resolved);
+            }
+            return resolved;
+        }
     }
-    let parts: Vec<_> = path.components().collect();
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Component-wise resolution: canonicalize each existing segment; honour `..`
+/// on the resolved accumulator; lexical tail for not-yet-existing suffixes.
+fn resolve_components(path: &Path) -> PathBuf {
+    let comps: Vec<_> = path.components().collect();
     let mut i = 0;
-    let mut built = PathBuf::new();
-    while i < parts.len() {
-        match parts[i] {
+    let mut acc = PathBuf::new();
+    while i < comps.len() {
+        match comps[i] {
             Component::Prefix(_) | Component::RootDir => {
-                built.push(parts[i].as_os_str());
+                acc.push(comps[i].as_os_str());
                 i += 1;
             }
             _ => break,
         }
     }
-    while i < parts.len() {
-        if let Component::Normal(name) = parts[i] {
-            built.push(name);
-            if built
-                .symlink_metadata()
-                .map(|meta| meta.file_type().is_symlink())
-                .unwrap_or(false)
-            {
-                if let Ok(link) = std::fs::read_link(&built) {
-                    built = if link.is_absolute() {
-                        lexically_normalize(&link)
-                    } else {
-                        lexically_normalize(
-                            &built
-                                .parent()
-                                .unwrap_or(Path::new("/"))
-                                .join(link),
-                        )
-                    };
-                    if let Ok(canon) = std::fs::canonicalize(&built) {
-                        built = canon;
-                    }
+    while i < comps.len() {
+        match comps[i] {
+            Component::CurDir => i += 1,
+            Component::ParentDir => {
+                acc.pop();
+                i += 1;
+            }
+            Component::Normal(name) => {
+                let next = acc.join(name);
+                if next.exists() {
+                    acc = canonicalize_component(&next);
+                    i += 1;
+                } else {
+                    return append_lexical(acc, &comps[i..]);
                 }
             }
+            Component::Prefix(_) | Component::RootDir => {
+                acc.push(comps[i].as_os_str());
+                i += 1;
+            }
         }
-        i += 1;
     }
-    built
+    acc
 }
 
 /// Resolve a path for fence prefix checks (lexical `..`, partial canonicalize).
 pub fn resolve_fence_path(raw: &str, base: &Path) -> PathBuf {
-    canonicalize_existing_prefix(&join_base(raw, base))
+    resolve_components(&join_base(raw, base))
 }
 
 fn resolved_clean(path: &Path) -> PathBuf {
-    canonicalize_existing_prefix(path)
+    resolve_components(path)
 }
 
 fn path_allowed(resolved: &Path, cwd: &Path, allowed_extra: &[PathBuf]) -> bool {
@@ -372,6 +379,7 @@ pub fn snapshot(protected_roots: &[PathBuf], fence: &[String], cwd: &Path) -> Di
                 continue;
             };
             if meta.file_type().is_symlink() {
+                record_symlink(&mut digest, &target);
                 continue;
             }
             if meta.is_file() {
@@ -385,6 +393,25 @@ pub fn snapshot(protected_roots: &[PathBuf], fence: &[String], cwd: &Path) -> Di
 }
 
 const SKIP_WALK_DIR_NAMES: &[&str] = &[".git", "target", "node_modules"];
+
+fn symlink_target_hash(path: &Path) -> u64 {
+    let Ok(link) = std::fs::read_link(path) else {
+        return 0;
+    };
+    let mut hasher = DefaultHasher::new();
+    link.to_string_lossy().hash(&mut hasher);
+    hasher.finish()
+}
+
+fn record_symlink(digest: &mut Digest, path: &Path) {
+    digest.insert(
+        path.to_path_buf(),
+        FileMeta {
+            size: 0,
+            content_hash: symlink_target_hash(path),
+        },
+    );
+}
 
 fn record_file(digest: &mut Digest, path: &Path) {
     let Ok(meta) = path.symlink_metadata() else {
@@ -413,6 +440,7 @@ fn walk_dir(digest: &mut Digest, dir: &Path) {
             continue;
         };
         if meta.file_type().is_symlink() {
+            record_symlink(digest, &path);
             continue;
         }
         if meta.is_file() {
@@ -523,7 +551,13 @@ pub fn parse_git_porcelain_v1_z(output: &[u8]) -> Vec<String> {
                 break;
             }
         }
-        if let Some(path) = fields.into_iter().next() {
+        if is_rename && fields.len() >= 2 {
+            for path in fields {
+                if !path.is_empty() {
+                    paths.push(path);
+                }
+            }
+        } else if let Some(path) = fields.into_iter().next() {
             if !path.is_empty() {
                 paths.push(path);
             }
@@ -702,6 +736,21 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn symlink_dotdot_escape_for_new_file() {
+        use std::os::unix::fs::symlink;
+        let cwd = unique_temp("fence-slink-dotdot");
+        let outside = unique_temp("fence-slink-dotdot-out");
+        fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, cwd.join("link")).unwrap();
+        let args = serde_json::json!({"path": "link/../evil.txt"})
+            .as_object()
+            .unwrap()
+            .clone();
+        assert!(tool_escape("edit", &args, &cwd, &[]).is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn symlink_outside_escape_for_new_file() {
         use std::os::unix::fs::symlink;
         let cwd = unique_temp("fence-slink-cwd");
@@ -752,7 +801,27 @@ mod tests {
         let mut raw = b"?? out side.txt\0".to_vec();
         raw.extend_from_slice(b"R  in.txt\0outside.txt\0");
         let paths = parse_git_porcelain_v1_z(&raw);
-        assert_eq!(paths, vec!["out side.txt".to_string(), "in.txt".to_string()]);
+        assert!(paths.contains(&"out side.txt".to_string()));
+        assert!(paths.contains(&"in.txt".to_string()));
+        assert!(paths.contains(&"outside.txt".to_string()));
+        let cwd = unique_temp("fence-parse-rename");
+        let fence = vec!["in.txt".into()];
+        let drift: Vec<_> = paths
+            .iter()
+            .filter(|path| !in_fence(path, &cwd, &fence))
+            .cloned()
+            .collect();
+        assert_eq!(
+            drift,
+            vec!["out side.txt".to_string(), "outside.txt".to_string()]
+        );
+        let paths2 = parse_git_porcelain_v1_z(b"R  outside2.txt\0in.txt\0");
+        let drift2: Vec<_> = paths2
+            .iter()
+            .filter(|path| !in_fence(path, &cwd, &fence))
+            .cloned()
+            .collect();
+        assert_eq!(drift2, vec!["outside2.txt".to_string()]);
     }
 
     #[test]
@@ -777,6 +846,79 @@ mod tests {
             .unwrap();
         let paths = rt.block_on(drift(&cwd, &["in.txt".into()]));
         assert_eq!(paths, vec!["out side.txt".to_string()]);
+    }
+
+    #[test]
+    fn path_arg_keys_all_checked_for_escape() {
+        let cwd = unique_temp("fence-path-keys");
+        let outside = unique_temp("fence-path-keys-out");
+        fs::create_dir_all(&outside).unwrap();
+        let outside_file = outside.join("x");
+        let args = serde_json::json!({"filePath": outside_file.display().to_string()})
+            .as_object()
+            .unwrap()
+            .clone();
+        assert!(tool_escape("edit", &args, &cwd, &[]).is_some());
+        let args = serde_json::json!({"targetDirectory": outside.display().to_string()})
+            .as_object()
+            .unwrap()
+            .clone();
+        assert!(tool_escape("write", &args, &cwd, &[]).is_some());
+        let args = serde_json::json!({"arguments": {"path": outside_file.display().to_string()}})
+            .as_object()
+            .unwrap()
+            .clone();
+        assert!(tool_escape("edit", &args, &cwd, &[]).is_some());
+        fs::write(cwd.join("inside.txt"), b"i").unwrap();
+        let args = serde_json::json!({
+            "path": "inside.txt",
+            "file_path": outside_file.display().to_string(),
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        assert!(tool_escape("edit", &args, &cwd, &[]).is_some());
+    }
+
+    #[test]
+    fn snapshot_skips_vcs_and_vendor_dirs() {
+        let root = unique_temp("fence-snap-skip");
+        let fenced = root.join("pkg");
+        fs::create_dir_all(fenced.join(".git")).unwrap();
+        fs::create_dir_all(fenced.join("target")).unwrap();
+        fs::create_dir_all(fenced.join("node_modules")).unwrap();
+        fs::write(fenced.join(".git/config"), b"1").unwrap();
+        fs::write(fenced.join("target/lib.rlib"), b"2").unwrap();
+        fs::write(fenced.join("node_modules/x.js"), b"3").unwrap();
+        fs::write(fenced.join("ok.txt"), b"ok").unwrap();
+        let before = snapshot(&[root.clone()], &["pkg".into()], &root);
+        fs::write(fenced.join(".git/config"), b"changed").unwrap();
+        fs::write(fenced.join("target/lib.rlib"), b"changed").unwrap();
+        fs::write(fenced.join("node_modules/x.js"), b"changed").unwrap();
+        let after = snapshot(&[root.clone()], &["pkg".into()], &root);
+        assert!(changed(&before, &after).is_empty());
+        fs::write(fenced.join("ok.txt"), b"changed").unwrap();
+        let after2 = snapshot(&[root.clone()], &["pkg".into()], &root);
+        assert_eq!(changed(&after, &after2), vec![fenced.join("ok.txt")]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_records_symlink_without_following() {
+        use std::os::unix::fs::symlink;
+        let root = unique_temp("fence-snap-link");
+        let fenced = root.join("tree");
+        fs::create_dir_all(&fenced).unwrap();
+        let outside = unique_temp("fence-snap-link-out");
+        fs::write(outside.join("secret.txt"), b"s").unwrap();
+        symlink(&outside, fenced.join("linkdir")).unwrap();
+        let before = snapshot(&[root.clone()], &["tree".into()], &root);
+        let other = unique_temp("fence-snap-link-other");
+        fs::create_dir_all(&other).unwrap();
+        fs::remove_file(fenced.join("linkdir")).unwrap();
+        symlink(&other, fenced.join("linkdir")).unwrap();
+        let after = snapshot(&[root.clone()], &["tree".into()], &root);
+        assert_eq!(changed(&before, &after), vec![fenced.join("linkdir")]);
     }
 
     #[test]
