@@ -1,0 +1,7 @@
+# Seat's jev_verify question (citation-check cookbook shape).
+[question.relation]
+type = "choice"
+instructions = "How does the section relate to the claim?"
+criteria_supports = "The section states the claim or directly implies that it is true."
+criteria_contradicts = "The section states the opposite of the claim or implies it is false."
+criteria_says_nothing = "The section does not address what the claim asserts, either way."

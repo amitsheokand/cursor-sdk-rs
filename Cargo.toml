@@ -1,5 +1,5 @@
 [workspace]
-members = ["bridge-fetch"]
+members = ["bridge-fetch", "seat"]
 
 [package]
 name = "cursor-sdk-rs"

@@ -1,0 +1,8 @@
+# Seat's tool-pruning template (classify-then-act): one Noul per offered
+# tool, asked together in a single request (speculative fan-out). {name}
+# and {description} are bound at runtime; the wording stays in config.
+[question.select_tools]
+type = "noul"
+instructions = "Is the tool `{name}` relevant to the task? Tool: {description}"
+criteria_true = "The task needs this tool's capability to succeed."
+criteria_false = "The task does not need this tool."

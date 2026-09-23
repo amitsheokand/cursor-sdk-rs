@@ -1,0 +1,37 @@
+[package]
+name = "cursor-seat"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "MIT"
+description = "Cursor seat binary: typed stdin inbox, omission-reporting context, durable at-most-once run"
+readme = "../README.md"
+
+[lib]
+name = "cursor_seat"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cursor-seat"
+path = "src/main.rs"
+
+[dependencies]
+cursor_sdk = { package = "cursor-sdk-rs", path = ".." }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+toml = "0.8"
+tokio = { version = "1", features = ["rt", "macros", "io-util", "io-std", "time", "fs", "sync", "process"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+serde_json = "1"
+bytes = "1"
+base64 = "0.22"
+prost = "0.13"
+prost-types = "0.13"
+hyper = { version = "1", features = ["server", "http1", "client"] }
+hyper-util = { version = "0.1", features = ["server", "http1", "tokio", "client", "client-legacy"] }
+http-body-util = "0.1"

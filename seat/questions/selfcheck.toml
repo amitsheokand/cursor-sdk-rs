@@ -1,0 +1,6 @@
+# Seat's self-check question (Noul; pass at p >= 0.5).
+[question.receipt_supported]
+type = "noul"
+instructions = "Does the turn output match the evidence in the diff: every claimed file, test, and result appears in the attached evidence?"
+criteria_true = "Every claim in the output appears in the diff or is otherwise evidenced."
+criteria_false = "A claim is missing from evidence, contradicted by evidence, or has no evidence."

@@ -1,0 +1,7 @@
+# Seat's trivial-task gate: skip the self-check follow-up loop entirely
+# when the task needs no verification turn (pass at p >= 0.5).
+[question.trivial_task]
+type = "noul"
+instructions = "Is this task trivially completable in one turn with no verification needed?"
+criteria_true = "A one-shot task: write a string, echo output, single small edit."
+criteria_false = "A task needing exploration, multiple steps, or result verification."

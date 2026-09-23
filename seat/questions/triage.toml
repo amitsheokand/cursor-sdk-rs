@@ -1,0 +1,13 @@
+# Seat's residue triage question: only the Unknown error kind reaches it.
+[question.triage]
+type = "choice"
+instructions = "What class best explains this seat failure?"
+options = [
+  "transient: a wire, model, or upstream hiccup; a retry on unchanged input is likely to pass.",
+  "busy: a rate or usage limit was hit; wait out retry_after and try again.",
+  "auth: credentials missing, rejected, or lacking permission; retrying unchanged will fail the same way.",
+  "stale: the agent, run, or resource is gone or archived; start over with fresh state.",
+  "model: the model id, effort, or params are unknown or rejected; fix the request.",
+  "seat: the seat's own request, config, or bug; fix the seat or its inputs.",
+  "other: none of the above classes explains the failure.",
+]
