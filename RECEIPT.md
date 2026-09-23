@@ -1,21 +1,30 @@
 # RECEIPT — T-seat-fence-attribute
 
-## Changes
+## Review round 1
 
-- `seat/src/fence.rs`: `attribute`, `rebaseline_entries`, `containing_protected_root`, `is_regular_file` (after `walk_dir` / before `changed`); `worktree_file_agent_authored` + `git HEAD:<rel>` check on hash matches
-- `seat/src/run.rs`: mutable `protected_baseline` + `fence_external_emitted` on `DriveState`; mid-run/post-drive attribution via `spawn_blocking`; `emit_fence_external`; `DriveFlags` carries baseline + dedup set
-- `seat/PROTOCOL.md`: document `fence` kind `external` and worktree hash attribution rule (+ agent-authored via git HEAD)
-- `seat/tests/fence_run.rs`: updated escape fixtures to copy worktree content; new external/attribution integration tests; `git_head_then_agent_edit` for git-backed worktrees
+| Finding | Fix |
+|--------|-----|
+| HEAD-match false escape on owner revert | Escape requires protected repo path dirty (`git status --porcelain` on root), not worktree vs HEAD |
+| Git env pollution / hang risk | `git` with `GIT_*` cleared, `LC_ALL=C`, 10s timeout + kill |
+| Git failure misclassified | Mid-run **undecided** (no event/rebaseline/dedup); post-drive `external` with `tool: "undecided"` |
+| Snapshot/hash race | `snapshot_and_attribute` in one `spawn_blocking` pass |
+| Self-check follow-up stale baseline | Pass `flags.protected_baseline` + dedup into follow-up `drive` + `apply_post_drive_fence` |
+| Attach baseline scope undocumented | PROTOCOL.md + `attach_protected_baseline_only_reports_post_attach_changes` |
+| External dedup test timing | Stream open ≥5s / multiple heartbeat windows before finish |
+| Protected escape fixtures | Git repo on primary (`init_protected_fence_git`) for dirty detection |
 
-## Coordinator review
+## Changes (cumulative)
 
-Equal hash match requires worktree file to differ from `git HEAD:<rel>` (or be new at HEAD); owner revert to HEAD while worktree clean → `external`, not escape; git failure fail-open to `external`.
+- `seat/src/fence.rs`: `AttributeResult`, `snapshot_and_attribute`, dirty-primary `attribute`, robust `git_status_dirty_rels`
+- `seat/src/run.rs`: `apply_attribute_result`, undecided handling, self-check post-fence, `DriveFence.fence_external_emitted`
+- `seat/PROTOCOL.md`: dirty-primary attribution, undecided, attach baseline
+- `seat/tests/fence_run.rs`: integration + attach/git-failure tests
 
 ## Tests
 
-Unit (`seat/src/fence.rs`): `attribute_worktree_copy_is_escape`, `attribute_primary_revert_to_head_while_worktree_clean_is_external`, `attribute_new_untracked_worktree_copy_is_escape`, `attribute_different_content_is_external`, `attribute_missing_worktree_is_external`, `attribute_deletion_in_root_is_external`, `attribute_symlink_in_root_is_external` (unix)
+Unit: `attribute_primary_revert_to_head_while_worktree_clean_is_external`, `attribute_owner_commit_same_bytes_in_primary_is_external`, `attribute_agent_commit_in_worktree_then_copy_is_escape`, `attribute_git_failure_is_undecided`, `attribute_rename_in_primary_is_external` (+ prior attribute tests)
 
-Integration (`seat/tests/fence_run.rs`): `protected_root_midrun_external_edit_notices_once`, `protected_root_external_then_agent_copy_escapes`, `protected_root_post_drive_external_only`; updated `protected_root_midrun_escape_after_tool_call`, `protected_root_change_bounces`, `tool_call_completion_runs_protected_snapshot_when_due`
+Integration: `protected_root_git_failure_post_drive_emits_undecided`, `attach_protected_baseline_only_reports_post_attach_changes`; updated `protected_root_midrun_external_edit_notices_once`
 
 ## Gate (tail)
 

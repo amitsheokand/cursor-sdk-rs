@@ -89,13 +89,16 @@ run failures arrives in P4. Controls arriving after the result are moot
   `cwd` or `session_dir`.
 - During the drive loop, protected-root snapshots are re-run after each
   `tool_call` (debounced to at most once per second) and on every heartbeat
-  tick. Changes from the baseline are attributed: if a changed protected file
-  is a regular file whose content hash matches the worktree copy at the same
-  relative path **and** the worktree copy is agent-authored (its hash differs
-  from `git HEAD:<rel>` in the worktree, or the path is new at HEAD), that is an
-  agent copy (`fence` `escape`, run cancelled). A hash match where the worktree
-  still matches HEAD (e.g. owner `git checkout --` on the primary) is
-  `external`. Git errors during that check fail open to `external`. Any
+  tick. Changes from the baseline are attributed in one blocking pass (snapshot,
+  hash protected/worktree copies, then git). Escape iff the protected file is a
+  regular file, its content hash matches the worktree copy, **and** the path is
+  dirty in the protected repo (`git status --porcelain` filter on that relative
+  path). Owner commit/pull/revert/stash (primary clean) is `external`. Git
+  status failure mid-run leaves the path undecided (no event, no rebaseline,
+  retry next tick); post-drive undecided paths emit `external` with
+  `tool: "undecided"` (outcome unchanged). On resume attach, the protected
+  baseline is taken at re-attach time — only changes after attach are reported.
+  Any
   other change (different content, deletion, symlink, missing worktree file) is
   external: one `fence` `external` event per path, baseline updated so the same
   edit is not re-reported, outcome unchanged. The post-drive snapshot uses the

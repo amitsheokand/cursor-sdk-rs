@@ -29,7 +29,7 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 
 use crate::clip::{archive_text, bound_output, bound_output_with_path};
-use crate::fence::{attribute, changed, drift, rebaseline_entries, snapshot, Digest};
+use crate::fence::{drift, rebaseline_entries, snapshot, snapshot_and_attribute, AttributeResult, Digest};
 use crate::context::build_context;
 use crate::inbox::Inbox;
 use crate::jev::{
@@ -402,6 +402,7 @@ pub async fn run_seat(
             protected_roots: protected_roots.clone(),
             fence_entries: request.fence.clone(),
             protected_baseline: protected_before.clone(),
+            fence_external_emitted: HashSet::new(),
         },
     )
     .await;
@@ -490,7 +491,7 @@ pub async fn run_seat(
                         match agent.send_with(followup, options).await {
                             Ok(next) => {
                                 turns += 1;
-                                let (next_result, next_flags) = drive(
+                                let (mut next_result, mut next_flags) = drive(
                                     &request,
                                     &handles,
                                     next,
@@ -507,8 +508,29 @@ pub async fn run_seat(
                                         guard_tools,
                                         protected_roots: protected_roots.clone(),
                                         fence_entries: request.fence.clone(),
-                                        protected_baseline: protected_before.clone(),
+                                        protected_baseline: flags.protected_baseline.clone(),
+                                        fence_external_emitted: flags.fence_external_emitted.clone(),
                                     },
+                                )
+                                .await;
+                                (next_result, next_flags) = apply_post_drive_fence(
+                                    &request,
+                                    &cwd,
+                                    &allowed_extra,
+                                    &protected_roots,
+                                    next_result,
+                                    next_flags,
+                                    Vec::new(),
+                                    attempts,
+                                    wall_start,
+                                    client,
+                                    Some(&agent),
+                                    &handles.agent_id,
+                                    &handles,
+                                    &mut inbox,
+                                    &mut session,
+                                    guard_tools,
+                                    &mut emit,
                                 )
                                 .await;
                                 result = next_result;
@@ -898,6 +920,7 @@ async fn attach(
                     protected_roots: protected_roots.clone(),
                     fence_entries: request.fence.clone(),
                     protected_baseline: protected_before.clone(),
+                    fence_external_emitted: HashSet::new(),
                 },
             )
             .await;
@@ -952,6 +975,7 @@ struct DriveFence {
     protected_roots: Vec<PathBuf>,
     fence_entries: Vec<String>,
     protected_baseline: Option<Digest>,
+    fence_external_emitted: HashSet<String>,
 }
 
 /// Flags the drive loop hands back for post-turn decisions.
@@ -1002,9 +1026,8 @@ async fn drive(
     state.start = Some(wall_start);
     // Baseline snapshot was just taken; debounce mid-run samples (incl. interval's first tick).
     state.last_protected_snapshot = Some(Instant::now());
-    if fence.protected_baseline.is_some() {
-        state.protected_baseline = fence.protected_baseline.clone();
-    }
+    state.protected_baseline = fence.protected_baseline.clone();
+    state.fence_external_emitted = fence.fence_external_emitted.clone();
     if let Some((run_id, agent_id)) = attached {
         // Resumed attach: the run is live remotely (ObserveRun
         // succeeded), so announce it up front. Controls queued before the
@@ -1256,6 +1279,27 @@ async fn snapshot_async(protected_roots: &[PathBuf], fence: &[String], cwd: &Pat
     }
 }
 
+fn apply_attribute_result(
+    after: &Digest,
+    baseline: Option<&mut Digest>,
+    emitted: &mut HashSet<String>,
+    classified: AttributeResult,
+    fail_open_undecided: bool,
+    emit: &mut dyn FnMut(SeatEventKind),
+) -> Vec<PathBuf> {
+    if let Some(base) = baseline {
+        rebaseline_entries(base, after, &classified.external);
+        if fail_open_undecided {
+            rebaseline_entries(base, after, &classified.undecided);
+        }
+    }
+    emit_fence_external(&classified.external, "", emitted, emit);
+    if fail_open_undecided {
+        emit_fence_external(&classified.undecided, "undecided", emitted, emit);
+    }
+    classified.escapes
+}
+
 fn emit_fence_drift(paths: &[String], emit: &mut dyn FnMut(SeatEventKind)) {
     for path in paths {
         emit(SeatEventKind::Fence {
@@ -1289,25 +1333,27 @@ async fn apply_post_drive_fence(
     let mut protected_baseline = flags.protected_baseline.take();
     let mut fence_external_emitted = std::mem::take(&mut flags.fence_external_emitted);
     if let Some(before) = protected_baseline.as_ref() {
-        let Some(after) = snapshot_async(protected_roots, &request.fence, cwd).await else {
-            flags.protected_baseline = protected_baseline;
-            flags.fence_external_emitted = fence_external_emitted;
-            return (result, flags);
-        };
-        let changed_paths = changed(before, &after);
-        if !changed_paths.is_empty() {
-            let roots = protected_roots.to_vec();
-            let cwd_buf = cwd.to_path_buf();
-            let after_copy = after.clone();
-            let classified = tokio::task::spawn_blocking(move || {
-                attribute(&changed_paths, &after_copy, &roots, &cwd_buf)
-            })
-            .await;
-            if let Ok((escapes, external)) = classified {
-                if let Some(base) = protected_baseline.as_mut() {
-                    rebaseline_entries(base, &after, &external);
-                }
-                emit_fence_external(&external, &mut fence_external_emitted, emit);
+        let roots = protected_roots.to_vec();
+        let cwd_buf = cwd.to_path_buf();
+        let fence = request.fence.clone();
+        let before_copy = before.clone();
+        let classified = tokio::task::spawn_blocking(move || {
+            snapshot_and_attribute(&before_copy, &roots, &fence, &cwd_buf)
+        })
+        .await;
+        if let Ok((after, classified)) = classified {
+            if !classified.escapes.is_empty()
+                || !classified.external.is_empty()
+                || !classified.undecided.is_empty()
+            {
+                let escapes = apply_attribute_result(
+                    &after,
+                    protected_baseline.as_mut(),
+                    &mut fence_external_emitted,
+                    classified,
+                    true,
+                    emit,
+                );
                 if !escapes.is_empty() {
                     result = fence_escape_result(
                         request,
@@ -1365,6 +1411,7 @@ async fn apply_post_drive_fence(
                             protected_roots: protected_roots.to_vec(),
                             fence_entries: request.fence.clone(),
                             protected_baseline: protected_baseline.clone(),
+                            fence_external_emitted: fence_external_emitted.clone(),
                         },
                     )
                     .await;
@@ -1467,6 +1514,7 @@ async fn emit_fence_escape(
 
 fn emit_fence_external(
     paths: &[PathBuf],
+    tool: &str,
     emitted: &mut HashSet<String>,
     emit: &mut dyn FnMut(SeatEventKind),
 ) {
@@ -1476,7 +1524,7 @@ fn emit_fence_external(
             emit(SeatEventKind::Fence {
                 kind: "external".to_string(),
                 path: key,
-                tool: String::new(),
+                tool: tool.to_string(),
             });
         }
     }
@@ -1503,29 +1551,31 @@ async fn maybe_protected_snapshot_escape(
         return;
     }
     state.last_protected_snapshot = Some(now);
-    let Some(after) =
-        snapshot_async(&fence.protected_roots, &fence.fence_entries, &fence.cwd).await
-    else {
-        return;
-    };
-    let changed_paths = changed(before, &after);
-    if changed_paths.is_empty() {
-        return;
-    }
+    let before = before.clone();
     let roots = fence.protected_roots.clone();
     let cwd = fence.cwd.clone();
-    let after_copy = after.clone();
+    let fence_entries = fence.fence_entries.clone();
     let classified = tokio::task::spawn_blocking(move || {
-        attribute(&changed_paths, &after_copy, &roots, &cwd)
+        snapshot_and_attribute(&before, &roots, &fence_entries, &cwd)
     })
     .await;
-    let Ok((escapes, external)) = classified else {
+    let Ok((after, classified)) = classified else {
         return;
     };
-    if let Some(base) = state.protected_baseline.as_mut() {
-        rebaseline_entries(base, &after, &external);
+    if classified.escapes.is_empty()
+        && classified.external.is_empty()
+        && classified.undecided.is_empty()
+    {
+        return;
     }
-    emit_fence_external(&external, &mut state.fence_external_emitted, emit);
+    let escapes = apply_attribute_result(
+        &after,
+        state.protected_baseline.as_mut(),
+        &mut state.fence_external_emitted,
+        classified,
+        false,
+        emit,
+    );
     if let Some(path) = escapes.first() {
         emit_fence_escape(path, "", state, handles, session, emit).await;
     }

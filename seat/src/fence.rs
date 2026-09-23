@@ -822,12 +822,6 @@ fn is_regular_file(path: &Path) -> bool {
         .is_some_and(|meta| meta.file_type().is_file() && !meta.file_type().is_symlink())
 }
 
-fn hash_bytes(bytes: &[u8]) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    bytes.hash(&mut hasher);
-    hasher.finish()
-}
-
 fn rel_path_git_spec(rel: &Path) -> String {
     rel.components()
         .map(|c| c.as_os_str().to_string_lossy())
@@ -835,75 +829,152 @@ fn rel_path_git_spec(rel: &Path) -> String {
         .join("/")
 }
 
-/// `Ok(None)` when `rel` is absent at HEAD; `Err` when git fails.
-fn git_head_bytes(cwd: &Path, rel: &Path) -> Result<Option<Vec<u8>>, ()> {
-    use std::process::Command;
-    let spec = format!("HEAD:{}", rel_path_git_spec(rel));
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(cwd)
-        .arg("show")
-        .arg(&spec)
-        .output()
-        .map_err(|_| ())?;
-    if output.status.success() {
-        return Ok(Some(output.stdout));
-    }
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    if stderr.contains("does not exist") || stderr.contains("exists on disk") {
-        return Ok(None);
-    }
-    Err(())
+/// Classification of protected-root snapshot deltas.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct AttributeResult {
+    pub escapes: Vec<PathBuf>,
+    pub external: Vec<PathBuf>,
+    pub undecided: Vec<PathBuf>,
 }
 
-/// Worktree file differs from `git HEAD:<rel>` (or is new at HEAD). Git failure → not authored.
-fn worktree_file_agent_authored(cwd: &Path, rel: &Path, worktree_copy: &Path) -> bool {
-    let worktree_hash = content_hash(worktree_copy);
-    match git_head_bytes(cwd, rel) {
-        Err(()) => false,
-        Ok(None) => true,
-        Ok(Some(head_bytes)) => worktree_hash != hash_bytes(&head_bytes),
-    }
+fn fence_git_program() -> PathBuf {
+    std::env::var_os("CURSOR_SEAT_FENCE_GIT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("git"))
 }
 
-/// Classify protected-root snapshot deltas: agent copy (worktree hash match) vs external.
+const GIT_STATUS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+fn git_status_dirty_rels(root: &Path, rels: &[String]) -> Result<std::collections::HashSet<String>, ()> {
+    use std::collections::HashSet;
+    use std::process::{Command, Stdio};
+    use std::sync::mpsc;
+    use std::thread;
+
+    if rels.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let mut cmd = Command::new(fence_git_program());
+    cmd.arg("-C")
+        .arg(root)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env("LC_ALL", "C")
+        .arg("status")
+        .arg("--porcelain=v1")
+        .arg("-z")
+        .arg("--untracked-files=all")
+        .arg("--");
+    for rel in rels {
+        cmd.arg(rel);
+    }
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let child = cmd.spawn().map_err(|_| ())?;
+    let pid = child.id();
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+    let output = match rx.recv_timeout(GIT_STATUS_TIMEOUT) {
+        Ok(Ok(output)) => output,
+        Ok(Err(_)) => return Err(()),
+        Err(_) => {
+            let _ = Command::new("kill")
+                .arg("-9")
+                .arg(pid.to_string())
+                .status();
+            return Err(());
+        }
+    };
+    if !output.status.success() {
+        return Err(());
+    }
+    Ok(parse_git_porcelain_v1_z(&output.stdout)
+        .into_iter()
+        .collect())
+}
+
+/// Snapshot fence paths under protected roots, diff against `before`, classify in one blocking pass.
+pub fn snapshot_and_attribute(
+    before: &Digest,
+    roots: &[PathBuf],
+    fence: &[String],
+    cwd: &Path,
+) -> (Digest, AttributeResult) {
+    let after = snapshot(roots, fence, cwd);
+    let changed_paths = changed(before, &after);
+    let result = attribute(&changed_paths, &after, roots, cwd);
+    (after, result)
+}
+
+/// Classify protected-root snapshot deltas (hash P/W together, then git dirty on protected repo).
 pub fn attribute(
     changed: &[PathBuf],
     after: &Digest,
     roots: &[PathBuf],
     cwd: &Path,
-) -> (Vec<PathBuf>, Vec<PathBuf>) {
-    let mut escapes = Vec::new();
-    let mut external = Vec::new();
+) -> AttributeResult {
+    use std::collections::HashMap;
+
+    let mut result = AttributeResult::default();
+    let mut hash_match_by_root: HashMap<PathBuf, Vec<(PathBuf, String)>> = HashMap::new();
+
     for path in changed {
         let Some(root) = containing_protected_root(path, roots) else {
-            external.push(path.clone());
+            result.external.push(path.clone());
             continue;
         };
         let Ok(rel) = path.strip_prefix(root) else {
-            external.push(path.clone());
+            result.external.push(path.clone());
             continue;
         };
         let worktree_copy = cwd.join(rel);
         if !is_regular_file(path) || !is_regular_file(&worktree_copy) {
-            external.push(path.clone());
+            result.external.push(path.clone());
             continue;
         }
-        let Some(protected_meta) = after.get(path) else {
-            external.push(path.clone());
+        let _ = after.get(path);
+        let protected_hash = content_hash(path);
+        let worktree_hash = content_hash(&worktree_copy);
+        if protected_hash != worktree_hash {
+            result.external.push(path.clone());
             continue;
-        };
-        if protected_meta.content_hash == content_hash(&worktree_copy) {
-            if worktree_file_agent_authored(cwd, rel, &worktree_copy) {
-                escapes.push(path.clone());
-            } else {
-                external.push(path.clone());
+        }
+        let rel_str = rel_path_git_spec(rel);
+        hash_match_by_root
+            .entry(root.clone())
+            .or_default()
+            .push((path.clone(), rel_str));
+    }
+
+    for (root, candidates) in hash_match_by_root {
+        let rels: Vec<String> = candidates.iter().map(|(_, rel)| rel.clone()).collect();
+        match git_status_dirty_rels(&root, &rels) {
+            Err(()) => {
+                for (path, _) in candidates {
+                    result.undecided.push(path);
+                }
             }
-        } else {
-            external.push(path.clone());
+            Ok(dirty) => {
+                for (path, rel) in candidates {
+                    if dirty.contains(&rel) {
+                        result.escapes.push(path);
+                    } else {
+                        result.external.push(path);
+                    }
+                }
+            }
         }
     }
-    (escapes, external)
+
+    result.escapes.sort();
+    result.escapes.dedup();
+    result.external.sort();
+    result.external.dedup();
+    result.undecided.sort();
+    result.undecided.dedup();
+    result
 }
 
 /// Advance the mid-run baseline for externally changed paths so they are not re-reported.
@@ -1197,9 +1268,109 @@ mod tests {
     fn attribute_worktree_copy_is_escape() {
         let wt = unique_temp("attr-wt");
         let root = unique_temp("attr-root");
+        init_git(&root);
+        fs::write(root.join("f.txt"), b"old").unwrap();
+        git_commit_all(&root, "base");
+        fs::write(wt.join("f.txt"), b"same").unwrap();
+        let roots = vec![root.clone()];
+        let before = snapshot(&roots, &["f.txt".into()], &wt);
+        fs::write(root.join("f.txt"), b"same").unwrap();
+        let after = snapshot(&roots, &["f.txt".into()], &wt);
+        let delta = changed(&before, &after);
+        let out = attribute(&delta, &after, &roots, &wt);
+        assert_eq!(out.external, Vec::<PathBuf>::new());
+        assert_eq!(out.escapes, vec![root.join("f.txt")]);
+    }
+
+    #[test]
+    fn attribute_primary_revert_to_head_while_worktree_clean_is_external() {
+        let wt = unique_temp("attr-wt-revert");
+        let root = unique_temp("attr-root-revert");
+        init_git(&root);
         init_git(&wt);
         fs::write(wt.join("f.txt"), b"head").unwrap();
         git_commit_all(&wt, "base");
+        fs::write(root.join("f.txt"), b"head").unwrap();
+        git_commit_all(&root, "base");
+        fs::write(root.join("f.txt"), b"dirty").unwrap();
+        let roots = vec![root.clone()];
+        let before = snapshot(&roots, &["f.txt".into()], &wt);
+        fs::write(root.join("f.txt"), b"head").unwrap();
+        Command::new("git")
+            .args(["checkout", "--", "f.txt"])
+            .current_dir(&root)
+            .output()
+            .expect("git checkout");
+        let after = snapshot(&roots, &["f.txt".into()], &wt);
+        let delta = changed(&before, &after);
+        let out = attribute(&delta, &after, &roots, &wt);
+        assert!(out.escapes.is_empty());
+        assert_eq!(out.external, vec![root.join("f.txt")]);
+    }
+
+    #[test]
+    fn attribute_owner_commit_same_bytes_in_primary_is_external() {
+        let wt = unique_temp("attr-wt-commit");
+        let root = unique_temp("attr-root-commit");
+        init_git(&root);
+        fs::write(wt.join("f.txt"), b"same").unwrap();
+        fs::write(root.join("f.txt"), b"old").unwrap();
+        git_commit_all(&root, "base");
+        let roots = vec![root.clone()];
+        let before = snapshot(&roots, &["f.txt".into()], &wt);
+        fs::write(root.join("f.txt"), b"same").unwrap();
+        git_commit_all(&root, "owner");
+        let after = snapshot(&roots, &["f.txt".into()], &wt);
+        let delta = changed(&before, &after);
+        let out = attribute(&delta, &after, &roots, &wt);
+        assert!(out.escapes.is_empty());
+        assert_eq!(out.external, vec![root.join("f.txt")]);
+    }
+
+    #[test]
+    fn attribute_agent_commit_in_worktree_then_copy_is_escape() {
+        let wt = unique_temp("attr-wt-agent-commit");
+        let root = unique_temp("attr-root-agent-commit");
+        init_git(&root);
+        init_git(&wt);
+        fs::write(wt.join("f.txt"), b"base").unwrap();
+        git_commit_all(&wt, "base");
+        fs::write(wt.join("f.txt"), b"agent").unwrap();
+        git_commit_all(&wt, "agent");
+        fs::write(root.join("f.txt"), b"base").unwrap();
+        git_commit_all(&root, "base");
+        let roots = vec![root.clone()];
+        let before = snapshot(&roots, &["f.txt".into()], &wt);
+        fs::write(root.join("f.txt"), b"agent").unwrap();
+        let after = snapshot(&roots, &["f.txt".into()], &wt);
+        let delta = changed(&before, &after);
+        let out = attribute(&delta, &after, &roots, &wt);
+        assert_eq!(out.external, Vec::<PathBuf>::new());
+        assert_eq!(out.escapes, vec![root.join("f.txt")]);
+    }
+
+    #[test]
+    fn attribute_new_untracked_worktree_copy_is_escape() {
+        let wt = unique_temp("attr-wt-new");
+        let root = unique_temp("attr-root-new");
+        init_git(&root);
+        fs::write(root.join("README.md"), b"init").unwrap();
+        git_commit_all(&root, "empty");
+        fs::write(wt.join("f.txt"), b"new-agent").unwrap();
+        let roots = vec![root.clone()];
+        let before = snapshot(&roots, &["f.txt".into()], &wt);
+        fs::write(root.join("f.txt"), b"new-agent").unwrap();
+        let after = snapshot(&roots, &["f.txt".into()], &wt);
+        let delta = changed(&before, &after);
+        let out = attribute(&delta, &after, &roots, &wt);
+        assert_eq!(out.external, Vec::<PathBuf>::new());
+        assert_eq!(out.escapes, vec![root.join("f.txt")]);
+    }
+
+    #[test]
+    fn attribute_git_failure_is_undecided() {
+        let wt = unique_temp("attr-wt-nogit");
+        let root = unique_temp("attr-root-nogit");
         fs::write(wt.join("f.txt"), b"same").unwrap();
         fs::write(root.join("f.txt"), b"old").unwrap();
         let roots = vec![root.clone()];
@@ -1207,45 +1378,28 @@ mod tests {
         fs::write(root.join("f.txt"), b"same").unwrap();
         let after = snapshot(&roots, &["f.txt".into()], &wt);
         let delta = changed(&before, &after);
-        let (escapes, external) = attribute(&delta, &after, &roots, &wt);
-        assert_eq!(external, Vec::<PathBuf>::new());
-        assert_eq!(escapes, vec![root.join("f.txt")]);
+        let out = attribute(&delta, &after, &roots, &wt);
+        assert!(out.escapes.is_empty());
+        assert!(out.external.is_empty());
+        assert_eq!(out.undecided, vec![root.join("f.txt")]);
     }
 
     #[test]
-    fn attribute_primary_revert_to_head_while_worktree_clean_is_external() {
-        let wt = unique_temp("attr-wt-revert");
-        let root = unique_temp("attr-root-revert");
-        init_git(&wt);
-        fs::write(wt.join("f.txt"), b"head").unwrap();
-        git_commit_all(&wt, "base");
-        fs::write(root.join("f.txt"), b"dirty").unwrap();
+    fn attribute_rename_in_primary_is_external() {
+        let wt = unique_temp("attr-wt-rename");
+        let root = unique_temp("attr-root-rename");
+        init_git(&root);
+        fs::write(root.join("f.txt"), b"x").unwrap();
+        git_commit_all(&root, "base");
+        fs::write(wt.join("f.txt"), b"x").unwrap();
         let roots = vec![root.clone()];
         let before = snapshot(&roots, &["f.txt".into()], &wt);
-        fs::write(root.join("f.txt"), b"head").unwrap();
-        let after = snapshot(&roots, &["f.txt".into()], &wt);
+        fs::rename(root.join("f.txt"), root.join("g.txt")).unwrap();
+        let after = snapshot(&roots, &["f.txt".into(), "g.txt".into()], &wt);
         let delta = changed(&before, &after);
-        let (escapes, external) = attribute(&delta, &after, &roots, &wt);
-        assert!(escapes.is_empty());
-        assert_eq!(external, vec![root.join("f.txt")]);
-    }
-
-    #[test]
-    fn attribute_new_untracked_worktree_copy_is_escape() {
-        let wt = unique_temp("attr-wt-new");
-        let root = unique_temp("attr-root-new");
-        init_git(&wt);
-        fs::write(wt.join("README.md"), b"init").unwrap();
-        git_commit_all(&wt, "empty");
-        fs::write(wt.join("f.txt"), b"new-agent").unwrap();
-        let roots = vec![root.clone()];
-        let before = snapshot(&roots, &["f.txt".into()], &wt);
-        fs::write(root.join("f.txt"), b"new-agent").unwrap();
-        let after = snapshot(&roots, &["f.txt".into()], &wt);
-        let delta = changed(&before, &after);
-        let (escapes, external) = attribute(&delta, &after, &roots, &wt);
-        assert_eq!(external, Vec::<PathBuf>::new());
-        assert_eq!(escapes, vec![root.join("f.txt")]);
+        let out = attribute(&delta, &after, &roots, &wt);
+        assert!(out.escapes.is_empty());
+        assert!(!out.external.is_empty());
     }
 
     #[test]
@@ -1259,9 +1413,9 @@ mod tests {
         fs::write(root.join("f.txt"), b"owner").unwrap();
         let after = snapshot(&roots, &["f.txt".into()], &wt);
         let delta = changed(&before, &after);
-        let (escapes, external) = attribute(&delta, &after, &roots, &wt);
-        assert!(escapes.is_empty());
-        assert_eq!(external, vec![root.join("f.txt")]);
+        let out = attribute(&delta, &after, &roots, &wt);
+        assert!(out.escapes.is_empty());
+        assert_eq!(out.external, vec![root.join("f.txt")]);
     }
 
     #[test]
@@ -1274,9 +1428,9 @@ mod tests {
         fs::write(root.join("f.txt"), b"new").unwrap();
         let after = snapshot(&roots, &["f.txt".into()], &wt);
         let delta = changed(&before, &after);
-        let (escapes, external) = attribute(&delta, &after, &roots, &wt);
-        assert!(escapes.is_empty());
-        assert_eq!(external.len(), 1);
+        let out = attribute(&delta, &after, &roots, &wt);
+        assert!(out.escapes.is_empty());
+        assert_eq!(out.external.len(), 1);
     }
 
     #[test]
@@ -1290,9 +1444,9 @@ mod tests {
         fs::remove_file(root.join("f.txt")).unwrap();
         let after = snapshot(&roots, &["f.txt".into()], &wt);
         let delta = changed(&before, &after);
-        let (escapes, external) = attribute(&delta, &after, &roots, &wt);
-        assert!(escapes.is_empty());
-        assert_eq!(external, vec![root.join("f.txt")]);
+        let out = attribute(&delta, &after, &roots, &wt);
+        assert!(out.escapes.is_empty());
+        assert_eq!(out.external, vec![root.join("f.txt")]);
     }
 
     #[cfg(unix)]
@@ -1309,9 +1463,9 @@ mod tests {
         symlink(wt.join("f.txt"), root.join("f.txt")).unwrap();
         let after = snapshot(&roots, &["f.txt".into()], &wt);
         let delta = changed(&before, &after);
-        let (escapes, external) = attribute(&delta, &after, &roots, &wt);
-        assert!(escapes.is_empty());
-        assert_eq!(external, vec![root.join("f.txt")]);
+        let out = attribute(&delta, &after, &roots, &wt);
+        assert!(out.escapes.is_empty());
+        assert_eq!(out.external, vec![root.join("f.txt")]);
     }
 
     #[test]

@@ -135,6 +135,21 @@ fn init_git_repo(dir: &PathBuf) {
 }
 
 /// Commits `rel` at HEAD in `cwd`, then leaves the worktree file at `agent_bytes`.
+fn init_protected_fence_git(protected: &PathBuf, rel: &str, committed: &[u8]) {
+    init_git_repo(protected);
+    fs::write(protected.join(rel), committed).unwrap();
+    Command::new("git")
+        .args(["add", rel])
+        .current_dir(protected)
+        .output()
+        .expect("git add");
+    Command::new("git")
+        .args(["commit", "-m", "base"])
+        .current_dir(protected)
+        .output()
+        .expect("git commit");
+}
+
 fn git_head_then_agent_edit(cwd: &PathBuf, rel: &str, head_bytes: &[u8], agent_bytes: &[u8]) {
     init_git_repo(cwd);
     fs::write(cwd.join(rel), head_bytes).unwrap();
@@ -365,7 +380,7 @@ async fn tool_call_completion_runs_protected_snapshot_when_due() {
     let tracked = protected.join("mirror.txt");
     let agent_body = b"agent-copy";
     git_head_then_agent_edit(&cwd, "mirror.txt", b"before", agent_body);
-    fs::write(&tracked, b"before").unwrap();
+    init_protected_fence_git(&protected, "mirror.txt", b"before");
 
     let bridge = FakeBridge::start().await;
     script_models_create_close(&bridge);
@@ -510,7 +525,7 @@ async fn protected_root_midrun_escape_after_tool_call() {
     let tracked = protected.join("mirror.txt");
     let agent_body = b"agent-copy";
     git_head_then_agent_edit(&cwd, "mirror.txt", b"before", agent_body);
-    fs::write(&tracked, b"before").unwrap();
+    init_protected_fence_git(&protected, "mirror.txt", b"before");
 
     let bridge = FakeBridge::start().await;
     script_models_create_close(&bridge);
@@ -864,7 +879,7 @@ async fn protected_root_change_bounces() {
     let cwd = workspace_dir();
     let protected = workspace_dir();
     let tracked = protected.join("mirror.txt");
-    fs::write(&tracked, b"before").unwrap();
+    init_protected_fence_git(&protected, "mirror.txt", b"before");
 
     let bridge = FakeBridge::start().await;
     script_models_create_close(&bridge);
@@ -939,12 +954,25 @@ fn fence_kind_count(events: &[cursor_seat::protocol::SeatEvent], kind: &str) -> 
         .count()
 }
 
+fn fence_external_with_tool(events: &[cursor_seat::protocol::SeatEvent], tool: &str) -> usize {
+    events
+        .iter()
+        .filter(|e| {
+            matches!(
+                &e.kind,
+                SeatEventKind::Fence { kind, tool: t, .. }
+                    if kind == "external" && t == tool
+            )
+        })
+        .count()
+}
+
 #[tokio::test]
 async fn protected_root_midrun_external_edit_notices_once() {
     let cwd = workspace_dir();
     let protected = workspace_dir();
     let tracked = protected.join("mirror.txt");
-    fs::write(&tracked, b"before").unwrap();
+    init_protected_fence_git(&protected, "mirror.txt", b"before");
 
     let bridge = FakeBridge::start().await;
     script_models_create_close(&bridge);
@@ -969,9 +997,9 @@ async fn protected_root_midrun_external_edit_notices_once() {
             Some("o2"),
         ),
     ));
-    timed.extend((0..32).map(|_| (Duration::ZERO, keepalive_frame())));
+    timed.extend((0..48).map(|_| (Duration::ZERO, keepalive_frame())));
     timed.push((
-        Duration::ZERO,
+        Duration::from_millis(5000),
         result_frame(
             "agent_1",
             "run_1",
@@ -1025,7 +1053,6 @@ async fn protected_root_midrun_external_edit_notices_once() {
     assert_eq!(fence_kind_count(&events, "external"), 1);
     assert_eq!(fence_kind_count(&events, "escape"), 0);
     assert_eq!(bridge.call_count("SdkAgentService/CancelRun"), 0);
-    tokio::time::sleep(Duration::from_millis(1500)).await;
     assert_eq!(fence_kind_count(&events, "external"), 1);
 }
 
@@ -1036,7 +1063,7 @@ async fn protected_root_external_then_agent_copy_escapes() {
     let tracked = protected.join("mirror.txt");
     let agent_body = b"agent-copy";
     git_head_then_agent_edit(&cwd, "mirror.txt", b"before", agent_body);
-    fs::write(&tracked, b"before").unwrap();
+    init_protected_fence_git(&protected, "mirror.txt", b"before");
 
     let bridge = FakeBridge::start().await;
     script_models_create_close(&bridge);
@@ -1131,7 +1158,7 @@ async fn protected_root_post_drive_external_only() {
     let cwd = workspace_dir();
     let protected = workspace_dir();
     let tracked = protected.join("mirror.txt");
-    fs::write(&tracked, b"before").unwrap();
+    init_protected_fence_git(&protected, "mirror.txt", b"before");
 
     let bridge = FakeBridge::start().await;
     script_models_create_close(&bridge);
@@ -1496,6 +1523,171 @@ async fn attach_resume_drift_correction_then_fence_drift() {
     assert_eq!(bridge.call_count("SdkAgentService/Send"), 1);
     assert_eq!(result.outcome, Outcome::Failed);
     assert_eq!(result.status, "fence_drift");
+}
+
+#[tokio::test]
+async fn protected_root_git_failure_post_drive_emits_undecided() {
+    let cwd = workspace_dir();
+    let protected = workspace_dir();
+    let agent_body = b"agent-copy";
+    git_head_then_agent_edit(&cwd, "mirror.txt", b"before", agent_body);
+    fs::write(protected.join("mirror.txt"), b"before").unwrap();
+
+    let bridge = FakeBridge::start().await;
+    script_models_create_close(&bridge);
+    bridge.expect(
+        "SdkAgentService/Send",
+        Reply::Stream(vec![
+            sdk_message_frame(
+                "system",
+                json!({"run_id": "run_1", "agent_id": "agent_1"}),
+                Some("o1"),
+            ),
+            sdk_message_frame(
+                "assistant",
+                json!({"message": {"content": [{"type": "text", "text": "ok"}]}}),
+                Some("o2"),
+            ),
+            result_frame(
+                "agent_1",
+                "run_1",
+                proto::RunLifecycleStatus::Finished,
+                "done",
+            ),
+            done_frame("agent_1", "run_1"),
+        ]),
+    );
+
+    let req = fenced_request(
+        cwd,
+        vec!["mirror.txt".into()],
+        vec![protected.to_string_lossy().into_owned()],
+    );
+    let tracked_mut = protected.join("mirror.txt");
+    let client = client_for(&bridge);
+    let inbox = Inbox::new(&[]).unwrap();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let run_fut = run_seat(&client, req, inbox, tx, None);
+    tokio::pin!(run_fut);
+    let mut events = Vec::new();
+    let mut result = None;
+    loop {
+        tokio::select! {
+            outcome = &mut run_fut, if result.is_none() => {
+                result = Some(outcome);
+            }
+            event = rx.recv() => match event {
+                Some(event) => {
+                    if matches!(&event.kind, SeatEventKind::RunStarted { .. }) {
+                        fs::write(&tracked_mut, agent_body).unwrap();
+                    }
+                    events.push(event.clone());
+                    if let SeatEventKind::Result(r) = event.kind {
+                        result = Some(r);
+                    }
+                }
+                None => break,
+            },
+        }
+        if result.is_some() {
+            break;
+        }
+    }
+    let result = result.expect("result");
+    assert_eq!(result.outcome, Outcome::Ok);
+    assert_eq!(fence_external_with_tool(&events, ""), 0);
+    assert_eq!(fence_external_with_tool(&events, "undecided"), 1);
+}
+
+#[tokio::test]
+async fn attach_protected_baseline_only_reports_post_attach_changes() {
+    use cursor_seat::session::{Opened, OpState, SessionStore};
+
+    let cwd = workspace_dir();
+    let protected = workspace_dir();
+    init_protected_fence_git(&protected, "mirror.txt", b"baseline");
+    fs::write(protected.join("mirror.txt"), b"pre-attach").unwrap();
+
+    let session_dir = workspace_dir();
+    let (mut store, opened) = SessionStore::open(&session_dir, "pkt-attach-fence:1").unwrap();
+    assert_eq!(opened, Opened::Fresh);
+    store.set_state(OpState::Awaiting).unwrap();
+    store.record_run("run_a", "agent_a").unwrap();
+    drop(store);
+
+    let bridge = FakeBridge::start().await;
+    let mut attach_stream = vec![(
+        Duration::ZERO,
+        sdk_message_frame(
+            "system",
+            json!({"run_id": "run_a", "agent_id": "agent_a"}),
+            Some("o1"),
+        ),
+    )];
+    attach_stream.extend((0..24).map(|_| (Duration::ZERO, keepalive_frame())));
+    attach_stream.push((
+        Duration::from_millis(2500),
+        result_frame(
+            "agent_a",
+            "run_a",
+            proto::RunLifecycleStatus::Finished,
+            "done",
+        ),
+    ));
+    attach_stream.push((Duration::ZERO, done_frame("agent_a", "run_a")));
+    bridge.expect("SdkAgentService/ObserveRun", Reply::StreamTimed(attach_stream));
+
+    let mut req = fenced_request(
+        cwd,
+        vec!["mirror.txt".into()],
+        vec![protected.to_string_lossy().into_owned()],
+    );
+    req.request_id = "pkt-attach-fence:1".into();
+    req.session_dir = Some(session_dir.to_string_lossy().into_owned());
+    req.limits.heartbeat_s = 1;
+
+    let tracked_mut = protected.join("mirror.txt");
+    let (store, opened) = SessionStore::open(&session_dir, "pkt-attach-fence:1").unwrap();
+    assert!(matches!(opened, Opened::Resume { .. }));
+
+    let client = client_for(&bridge);
+    let inbox = Inbox::new(&[]).unwrap();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let run_fut = run_seat(&client, req, inbox, tx, Some(store));
+    tokio::pin!(run_fut);
+    let mut events = Vec::new();
+    let mut result = None;
+    loop {
+        tokio::select! {
+            outcome = &mut run_fut, if result.is_none() => {
+                result = Some(outcome);
+            }
+            event = rx.recv() => match event {
+                Some(event) => {
+                    if matches!(&event.kind, SeatEventKind::RunStarted { .. }) {
+                        fs::write(&tracked_mut, b"post-attach").unwrap();
+                    }
+                    events.push(event.clone());
+                    if let SeatEventKind::Result(r) = event.kind {
+                        result = Some(r);
+                    }
+                }
+                None => break,
+            },
+        }
+        if result.is_some() {
+            break;
+        }
+    }
+    let result = result.expect("result");
+    assert_eq!(result.outcome, Outcome::Ok);
+    assert_eq!(fence_kind_count(&events, "external"), 1);
+    assert!(
+        events.iter().any(|e| matches!(
+            &e.kind,
+            SeatEventKind::Fence { path, .. } if path.contains("mirror.txt")
+        ))
+    );
 }
 
 #[test]
