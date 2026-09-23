@@ -1,32 +1,43 @@
 sdkrun_v1
 
-## Files changed (review fixes)
+## Review triage (7b41de9 follow-up)
+
+| Item | Status |
+|------|--------|
+| Path resolution for non-existent paths / symlinks | ACCEPTED — implemented |
+| Shell: all cwd keys; no command parse | ACCEPTED — implemented |
+| path_from_args: all keys + nested `arguments` | ACCEPTED — implemented |
+| Drift: porcelain=v1 -z parsing | ACCEPTED — implemented |
+| Snapshot: no symlink walk, skip dirs, spawn_blocking | ACCEPTED — implemented |
+| Emit `fence` drift events | ACCEPTED — implemented |
+| attach post-drive fence + shared helper | ACCEPTED — implemented |
+| MCP tool path classification | REJECTED — no change |
+| Split fence on whitespace | REJECTED — no change |
+| Fail-closed on git failure | REJECTED — no change |
+| Patch-body parsing | REJECTED — no change |
+
+## Files changed
 
 - `seat/src/fence.rs`
 - `seat/src/run.rs`
-- `seat/src/protocol.rs`
-- `seat/tests/support/mod.rs`
+- `seat/PROTOCOL.md`
+- `seat/tests/support/mod.rs` (unchanged this commit if only prior — include if touched)
+- `seat/tests/fence_run.rs`
 - `RECEIPT.md`
 
-## New / updated tests
+## cargo test -p cursor-seat (two consecutive runs)
 
-- `workspace_dir` uniqueness (pid + counter, remove before create)
-- `tilde_fence_entry_under_cwd_matches`
-- `fence_entry_strips_trailing_prose`
-- `absolute_fence_outside_cwd_is_ignored`
-- `fence_only_outside_entries_yields_no_drift`
-- `snapshot_ignores_mtime_only_change`
-- `snapshot_detects_content_change` (renamed from mtime-based)
+Run 1: **111 passed** (69 lib + 42 integration/doc)
 
-## cargo test -p cursor-seat (two consecutive runs, last ~10 lines each)
+Run 2: **111 passed**
 
-Run 1:
+Last 10 lines run 1:
 ```
 test ready_session_sends_normally_and_records ... ok
 test live_run_attaches_instead_of_resending ... ok
 test terminal_result_replays_with_no_bridge_contact ... ok
 
-test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
 
    Doc-tests cursor_seat
 
@@ -35,11 +46,11 @@ running 0 tests
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 ```
 
-Run 2:
+Last 10 lines run 2:
 ```
+test ready_session_sends_normally_and_records ... ok
 test live_run_attaches_instead_of_resending ... ok
 test terminal_result_replays_with_no_bridge_contact ... ok
-test ready_session_sends_normally_and_records ... ok
 
 test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 
@@ -49,5 +60,3 @@ running 0 tests
 
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 ```
-
-(Suite totals: 102 tests per run, all passed.)

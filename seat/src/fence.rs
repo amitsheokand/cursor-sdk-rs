@@ -68,13 +68,7 @@ fn entry_relative_to_cwd(raw: &str, cwd_canon: &Path) -> Option<String> {
     if token.is_empty() {
         return None;
     }
-    let expanded = expand_tilde(token);
-    let path = if expanded.is_absolute() {
-        expanded
-    } else {
-        cwd_canon.join(expanded)
-    };
-    let path = resolved_clean(&path);
+    let path = resolve_fence_path(token, cwd_canon);
     if !path_starts_with(&path, cwd_canon) {
         return None;
     }
@@ -134,8 +128,12 @@ pub fn tool_escape(
     if !is_writing_tool(&name) {
         return None;
     }
-    let path = path_from_args(args)?;
-    resolve_escape(&path, cwd, allowed_extra)
+    for path in all_path_from_args(args) {
+        if let Some(hit) = resolve_escape(&path, cwd, allowed_extra) {
+            return Some(hit);
+        }
+    }
+    None
 }
 
 fn is_read_only(name: &str) -> bool {
@@ -161,25 +159,34 @@ fn is_writing_tool(name: &str) -> bool {
         || name.contains("patch")
 }
 
-fn path_from_args(args: &serde_json::Map<String, Value>) -> Option<String> {
-    const KEYS: &[&str] = &[
-        "path",
-        "file_path",
-        "filePath",
-        "target_file",
-        "targetFile",
-        "target_directory",
-        "targetDirectory",
-    ];
-    for key in KEYS {
-        if let Some(value) = args.get(*key).and_then(Value::as_str) {
+const PATH_ARG_KEYS: &[&str] = &[
+    "path",
+    "file_path",
+    "filePath",
+    "target_file",
+    "targetFile",
+    "target_directory",
+    "targetDirectory",
+];
+
+fn collect_path_args(map: &serde_json::Map<String, Value>, out: &mut Vec<String>) {
+    for key in PATH_ARG_KEYS {
+        if let Some(value) = map.get(*key).and_then(Value::as_str) {
             let trimmed = value.trim();
             if !trimmed.is_empty() {
-                return Some(trimmed.to_string());
+                out.push(trimmed.to_string());
             }
         }
     }
-    None
+}
+
+fn all_path_from_args(args: &serde_json::Map<String, Value>) -> Vec<String> {
+    let mut paths = Vec::new();
+    collect_path_args(args, &mut paths);
+    if let Some(Value::Object(nested)) = args.get("arguments") {
+        collect_path_args(nested, &mut paths);
+    }
+    paths
 }
 
 fn shell_escape(
@@ -192,24 +199,17 @@ fn shell_escape(
         if let Some(value) = args.get(*key).and_then(Value::as_str) {
             let trimmed = value.trim();
             if !trimmed.is_empty() {
-                return resolve_escape(trimmed, cwd, allowed_extra);
+                if let Some(hit) = resolve_escape(trimmed, cwd, allowed_extra) {
+                    return Some(hit);
+                }
             }
         }
     }
     None
 }
 
-fn resolve_escape(
-    path: &str,
-    cwd: &Path,
-    allowed_extra: &[PathBuf],
-) -> Option<PathBuf> {
-    let resolved = if Path::new(path).is_absolute() {
-        PathBuf::from(path)
-    } else {
-        cwd.join(path)
-    };
-    let resolved = resolved_clean(&resolved);
+fn resolve_escape(path: &str, cwd: &Path, allowed_extra: &[PathBuf]) -> Option<PathBuf> {
+    let resolved = resolve_fence_path(path, cwd);
     if path_allowed(&resolved, cwd, allowed_extra) {
         None
     } else {
@@ -217,19 +217,131 @@ fn resolve_escape(
     }
 }
 
-fn resolved_clean(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+fn join_base(raw: &str, base: &Path) -> PathBuf {
+    let trimmed = raw.trim();
+    if trimmed.starts_with("~/") || trimmed == "~" {
+        expand_tilde(trimmed)
+    } else if Path::new(trimmed).is_absolute() {
+        PathBuf::from(trimmed)
+    } else {
+        base.join(trimmed)
+    }
 }
 
-fn path_allowed(path: &Path, cwd: &Path, allowed_extra: &[PathBuf]) -> bool {
-    let cwd = resolved_clean(cwd);
-    let path = resolved_clean(path);
-    if path_starts_with(&path, &cwd) {
+fn lexically_normalize(path: &Path) -> PathBuf {
+    let mut prefix = PathBuf::new();
+    let mut stack: Vec<std::ffi::OsString> = Vec::new();
+    for comp in path.components() {
+        match comp {
+            Component::Prefix(_) | Component::RootDir => prefix.push(comp.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                stack.pop();
+            }
+            Component::Normal(name) => stack.push(name.to_os_string()),
+        }
+    }
+    for part in stack {
+        prefix.push(part);
+    }
+    prefix
+}
+
+fn canonicalize_existing_prefix(path: &Path) -> PathBuf {
+    let path = lexically_normalize(path);
+    if path.as_os_str().is_empty() {
+        return path;
+    }
+    let mut suffix = Vec::new();
+    let mut current = path.clone();
+    loop {
+        if let Ok(canon) = std::fs::canonicalize(&current) {
+            let mut out = canon;
+            for part in suffix.iter().rev() {
+                out.push(part);
+            }
+            return expand_symlinks_along_path(&out);
+        }
+        match current.file_name() {
+            Some(name) => {
+                suffix.push(name.to_os_string());
+                if !current.pop() {
+                    return expand_symlinks_along_path(&path);
+                }
+            }
+            None => return expand_symlinks_along_path(&path),
+        }
+    }
+}
+
+fn expand_symlinks_along_path(path: &Path) -> PathBuf {
+    if !path.is_absolute() {
+        return path.to_path_buf();
+    }
+    let parts: Vec<_> = path.components().collect();
+    let mut i = 0;
+    let mut built = PathBuf::new();
+    while i < parts.len() {
+        match parts[i] {
+            Component::Prefix(_) | Component::RootDir => {
+                built.push(parts[i].as_os_str());
+                i += 1;
+            }
+            _ => break,
+        }
+    }
+    while i < parts.len() {
+        if let Component::Normal(name) = parts[i] {
+            built.push(name);
+            if built
+                .symlink_metadata()
+                .map(|meta| meta.file_type().is_symlink())
+                .unwrap_or(false)
+            {
+                if let Ok(link) = std::fs::read_link(&built) {
+                    built = if link.is_absolute() {
+                        lexically_normalize(&link)
+                    } else {
+                        lexically_normalize(
+                            &built
+                                .parent()
+                                .unwrap_or(Path::new("/"))
+                                .join(link),
+                        )
+                    };
+                    if let Ok(canon) = std::fs::canonicalize(&built) {
+                        built = canon;
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    built
+}
+
+/// Resolve a path for fence prefix checks (lexical `..`, partial canonicalize).
+pub fn resolve_fence_path(raw: &str, base: &Path) -> PathBuf {
+    canonicalize_existing_prefix(&join_base(raw, base))
+}
+
+fn resolved_clean(path: &Path) -> PathBuf {
+    canonicalize_existing_prefix(path)
+}
+
+fn path_allowed(resolved: &Path, cwd: &Path, allowed_extra: &[PathBuf]) -> bool {
+    let cwd_root = resolved_clean(cwd);
+    if path_starts_with(resolved, &cwd_root) {
         return true;
     }
-    allowed_extra
-        .iter()
-        .any(|extra| path_starts_with(&path, &resolved_clean(extra)))
+    allowed_extra.iter().any(|extra| {
+        let root = if extra.is_absolute() {
+            resolved_clean(extra)
+        } else {
+            resolved_clean(&cwd.join(extra))
+        };
+        path_starts_with(resolved, &root)
+    })
 }
 
 fn path_starts_with(path: &Path, prefix: &Path) -> bool {
@@ -256,9 +368,15 @@ pub fn snapshot(protected_roots: &[PathBuf], fence: &[String], cwd: &Path) -> Di
     for root in protected_roots {
         for entry in &rel_entries {
             let target = root.join(entry);
-            if target.is_file() {
+            let Ok(meta) = target.symlink_metadata() else {
+                continue;
+            };
+            if meta.file_type().is_symlink() {
+                continue;
+            }
+            if meta.is_file() {
                 record_file(&mut digest, &target);
-            } else if target.is_dir() {
+            } else if meta.is_dir() {
                 walk_dir(&mut digest, &target);
             }
         }
@@ -266,16 +384,22 @@ pub fn snapshot(protected_roots: &[PathBuf], fence: &[String], cwd: &Path) -> Di
     digest
 }
 
+const SKIP_WALK_DIR_NAMES: &[&str] = &[".git", "target", "node_modules"];
+
 fn record_file(digest: &mut Digest, path: &Path) {
-    if let Ok(meta) = std::fs::metadata(path) {
-        digest.insert(
-            path.to_path_buf(),
-            FileMeta {
-                size: meta.len(),
-                content_hash: content_hash(path),
-            },
-        );
+    let Ok(meta) = path.symlink_metadata() else {
+        return;
+    };
+    if meta.file_type().is_symlink() || !meta.is_file() {
+        return;
     }
+    digest.insert(
+        path.to_path_buf(),
+        FileMeta {
+            size: meta.len(),
+            content_hash: content_hash(path),
+        },
+    );
 }
 
 fn walk_dir(digest: &mut Digest, dir: &Path) {
@@ -285,9 +409,22 @@ fn walk_dir(digest: &mut Digest, dir: &Path) {
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.is_file() {
+        let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() {
+            continue;
+        }
+        if meta.is_file() {
             record_file(digest, &path);
-        } else if path.is_dir() {
+        } else if meta.is_dir() {
+            if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| SKIP_WALK_DIR_NAMES.contains(&name))
+            {
+                continue;
+            }
             walk_dir(digest, &path);
         }
     }
@@ -324,7 +461,8 @@ pub async fn drift(cwd: &Path, fence: &[String]) -> Vec<String> {
         .arg("-C")
         .arg(cwd)
         .arg("status")
-        .arg("--porcelain")
+        .arg("--porcelain=v1")
+        .arg("-z")
         .arg("--untracked-files=all")
         .output()
         .await;
@@ -334,24 +472,63 @@ pub async fn drift(cwd: &Path, fence: &[String]) -> Vec<String> {
     if !output.status.success() {
         return Vec::new();
     }
-    let text = String::from_utf8_lossy(&output.stdout);
     let mut paths = Vec::new();
-    for line in text.lines() {
-        if line.len() < 4 {
-            continue;
-        }
-        let rel = line[3..].trim();
-        if rel.is_empty() {
-            continue;
-        }
-        // status may list "a -> b" for renames; take the destination.
-        let rel = rel.rsplit(" -> ").next().unwrap_or(rel);
-        if !in_fence(rel, cwd, fence) {
-            paths.push(rel.to_string());
+    for rel in parse_git_porcelain_v1_z(&output.stdout) {
+        if !in_fence(&rel, cwd, fence) {
+            paths.push(rel);
         }
     }
     paths.sort();
     paths.dedup();
+    paths
+}
+
+/// Paths from `git status --porcelain=v1 -z` (destination path for renames).
+pub fn parse_git_porcelain_v1_z(output: &[u8]) -> Vec<String> {
+    let mut paths = Vec::new();
+    let mut i = 0;
+    while i < output.len() {
+        if i + 2 > output.len() {
+            break;
+        }
+        let status0 = output[i];
+        let status1 = output[i + 1];
+        i += 2;
+        if i < output.len() && output[i] == b' ' {
+            i += 1;
+        }
+        let is_rename = matches!(status0, b'R' | b'C') || matches!(status1, b'R' | b'C');
+        let mut fields = Vec::new();
+        while i < output.len() {
+            if output[i] == 0 {
+                i += 1;
+                if fields.is_empty() {
+                    continue;
+                }
+                break;
+            }
+            let start = i;
+            while i < output.len() && output[i] != 0 {
+                i += 1;
+            }
+            fields.push(String::from_utf8_lossy(&output[start..i]).into_owned());
+            if i < output.len() {
+                i += 1;
+            }
+            if is_rename {
+                if fields.len() >= 2 {
+                    break;
+                }
+            } else if !fields.is_empty() {
+                break;
+            }
+        }
+        if let Some(path) = fields.into_iter().next() {
+            if !path.is_empty() {
+                paths.push(path);
+            }
+        }
+    }
     paths
 }
 
@@ -384,6 +561,7 @@ pub fn tool_args_from_message(message: &StreamMessage) -> (String, serde_json::M
 mod tests {
     use super::*;
     use std::fs;
+    use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -504,6 +682,101 @@ mod tests {
         let after = snapshot(&[dir.clone()], &["tracked.txt".into()], &dir);
         let delta = changed(&before, &after);
         assert_eq!(delta, vec![file]);
+    }
+
+    #[test]
+    fn dotdot_escape_to_new_file_outside_cwd() {
+        let cwd = unique_temp("fence-dotdot");
+        let sibling = unique_temp("fence-dotdot-out");
+        fs::create_dir_all(&sibling).unwrap();
+        let rel = format!(
+            "../{}/new.txt",
+            sibling.file_name().unwrap().to_string_lossy()
+        );
+        let args = serde_json::json!({"path": rel})
+            .as_object()
+            .unwrap()
+            .clone();
+        assert!(tool_escape("edit", &args, &cwd, &[]).is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_outside_escape_for_new_file() {
+        use std::os::unix::fs::symlink;
+        let cwd = unique_temp("fence-slink-cwd");
+        let outside = unique_temp("fence-slink-out");
+        fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, cwd.join("link")).unwrap();
+        let args = serde_json::json!({"path": "link/new.txt"})
+            .as_object()
+            .unwrap()
+            .clone();
+        assert!(tool_escape("edit", &args, &cwd, &[]).is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_session_dir_allows_new_file() {
+        use std::os::unix::fs::symlink;
+        let cwd = unique_temp("fence-sess-cwd");
+        let outside = unique_temp("fence-sess-out");
+        fs::create_dir_all(&outside).unwrap();
+        let session = cwd.join("session-link");
+        symlink(&outside, &session).unwrap();
+        let target = outside.join("note.txt");
+        let args = serde_json::json!({"path": target.display().to_string()})
+            .as_object()
+            .unwrap()
+            .clone();
+        assert!(tool_escape("write", &args, &cwd, &[session]).is_none());
+    }
+
+    #[test]
+    fn shell_checks_all_cwd_keys() {
+        let cwd = unique_temp("fence-shell");
+        let outside = unique_temp("fence-shell-out");
+        fs::create_dir_all(&outside).unwrap();
+        let args = serde_json::json!({
+            "cwd": cwd.display().to_string(),
+            "working_directory": outside.display().to_string(),
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        assert!(tool_escape("shell", &args, &cwd, &[]).is_some());
+    }
+
+    #[test]
+    fn parse_porcelain_z_space_and_rename() {
+        let mut raw = b"?? out side.txt\0".to_vec();
+        raw.extend_from_slice(b"R  in.txt\0outside.txt\0");
+        let paths = parse_git_porcelain_v1_z(&raw);
+        assert_eq!(paths, vec!["out side.txt".to_string(), "in.txt".to_string()]);
+    }
+
+    #[test]
+    fn drift_path_with_space() {
+        let cwd = unique_temp("fence-space");
+        init_git(&cwd);
+        fs::write(cwd.join("in.txt"), b"x").unwrap();
+        Command::new("git")
+            .args(["add", "in.txt"])
+            .current_dir(&cwd)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(&cwd)
+            .output()
+            .unwrap();
+        fs::write(cwd.join("out side.txt"), b"y").unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let paths = rt.block_on(drift(&cwd, &["in.txt".into()]));
+        assert_eq!(paths, vec!["out side.txt".to_string()]);
     }
 
     #[test]

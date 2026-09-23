@@ -76,6 +76,8 @@ run failures arrives in P4. Controls arriving after the result are moot
   `verdict` is the Choice/Noul outcome; `p` its probability)
 - `fence {kind, path, tool}` (`kind` is `escape` or `drift`; `path` is the
   offending path; `tool` is the tool name when applicable)
+- Live escape checks inspect tool path/`cwd` arguments only; the seat does
+  not parse shell command strings (protected-root snapshots are the backstop).
 - final `result`
 
 `result`: `outcome: ok|failed|startup_error|busy|bounced|stale`,

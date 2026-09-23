@@ -29,7 +29,7 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 
 use crate::clip::{archive_text, bound_output, bound_output_with_path};
-use crate::fence::{changed, drift, snapshot};
+use crate::fence::{changed, drift, snapshot, Digest};
 use crate::context::build_context;
 use crate::inbox::Inbox;
 use crate::jev::{
@@ -349,7 +349,7 @@ pub async fn run_seat(
     let protected_before = if protected_roots.is_empty() {
         None
     } else {
-        Some(snapshot(&protected_roots, &request.fence, &cwd))
+        Some(snapshot_async(&protected_roots, &request.fence, &cwd).await)
     };
 
     // Phase D: open the stream on the same agent across retries.
@@ -403,87 +403,27 @@ pub async fn run_seat(
     )
     .await;
 
-    if let Some(before) = protected_before.as_ref() {
-        let after = snapshot(&protected_roots, &request.fence, &cwd);
-        let paths = changed(before, &after);
-        if !paths.is_empty() {
-            result = fence_escape_result(
-                &request,
-                &paths
-                    .iter()
-                    .map(|p| p.display().to_string())
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                &result,
-                attempts,
-                wall_start,
-                built.changes.clone(),
-                &mut session,
-            );
-        }
-    }
-
-    if result.outcome == Outcome::Ok && !request.fence.is_empty() {
-        let mut drift_paths = drift(&cwd, &request.fence).await;
-        if !drift_paths.is_empty() {
-            let listing = drift_paths.join("\n");
-            let followup = format!(
-                "These paths in the workspace are outside the packet fence and must be \
-                 reverted or removed before the run can succeed:\n{listing}\n\
-                 Revert or delete them, then end the turn."
-            );
-            record(&mut session, |store| store.set_state(OpState::Awaiting));
-            match agent.send_with(followup, SendOptions::new()).await {
-                Ok(next) => {
-                    let (next_result, next_flags) = drive(
-                        &request,
-                        &handles,
-                        next,
-                        &mut inbox,
-                        &mut session,
-                        None,
-                        Vec::new(),
-                        attempts,
-                        wall_start,
-                        &mut emit,
-                        DriveFence {
-                            cwd: cwd.clone(),
-                            allowed_extra: allowed_extra.clone(),
-                            guard_tools,
-                        },
-                    )
-                    .await;
-                    result = next_result;
-                    flags = next_flags;
-                    if result.outcome != Outcome::Ok {
-                        // The correction turn failed; drift is moot.
-                    } else {
-                        drift_paths = drift(&cwd, &request.fence).await;
-                    }
-                    if result.outcome == Outcome::Ok && !drift_paths.is_empty() {
-                        result = fence_drift_result(
-                            &request,
-                            &drift_paths.join("\n"),
-                            &result,
-                            attempts,
-                            wall_start,
-                            &mut session,
-                        );
-                    }
-                }
-                Err(_) => {
-                    result = fence_drift_result(
-                        &request,
-                        &listing,
-                        &result,
-                        attempts,
-                        wall_start,
-                        &mut session,
-                    );
-                }
-            }
-        }
-    }
+    (result, flags) = apply_post_drive_fence(
+        &request,
+        &cwd,
+        &allowed_extra,
+        &protected_roots,
+        protected_before.as_ref(),
+        result,
+        flags,
+        built.changes.clone(),
+        attempts,
+        wall_start,
+        client,
+        Some(&agent),
+        &handles.agent_id,
+        &handles,
+        &mut inbox,
+        &mut session,
+        guard_tools,
+        &mut emit,
+    )
+    .await;
 
     // P6 self-check: same-agent follow-up turns while the receipt check
     // fails. Only on success (a failed turn belongs to the drain's steer
@@ -923,23 +863,55 @@ async fn attach(
                 .map(PathBuf::from)
                 .into_iter()
                 .collect();
+            let protected_roots: Vec<PathBuf> = request
+                .protected_roots
+                .iter()
+                .map(PathBuf::from)
+                .collect();
             let guard_tools = !request.fence.is_empty() || !request.protected_roots.is_empty();
-            let (result, _) = drive(
+            // On resume, protected-root snapshots only cover changes after re-attach.
+            let protected_before = if protected_roots.is_empty() {
+                None
+            } else {
+                Some(snapshot_async(&protected_roots, &request.fence, &cwd).await)
+            };
+            let (result, flags) = drive(
                 request,
                 &handles,
                 run,
                 &mut inbox,
                 &mut session,
-                Some((run_id, agent_id)),
-                context_changes,
+                Some((run_id.clone(), agent_id.clone())),
+                context_changes.clone(),
                 attempts,
                 wall_start,
                 emit,
                 DriveFence {
-                    cwd,
-                    allowed_extra,
+                    cwd: cwd.clone(),
+                    allowed_extra: allowed_extra.clone(),
                     guard_tools,
                 },
+            )
+            .await;
+            let (result, _) = apply_post_drive_fence(
+                request,
+                &cwd,
+                &allowed_extra,
+                &protected_roots,
+                protected_before.as_ref(),
+                result,
+                flags,
+                context_changes,
+                attempts,
+                wall_start,
+                client,
+                None,
+                &agent_id,
+                &handles,
+                &mut inbox,
+                &mut session,
+                guard_tools,
+                emit,
             )
             .await;
             result
@@ -1226,6 +1198,138 @@ async fn apply_control(
         }
         ControlMode::Heartbeat => {}
     }
+}
+
+async fn snapshot_async(protected_roots: &[PathBuf], fence: &[String], cwd: &Path) -> Digest {
+    let roots = protected_roots.to_vec();
+    let fence = fence.to_vec();
+    let cwd = cwd.to_path_buf();
+    tokio::task::spawn_blocking(move || snapshot(&roots, &fence, &cwd))
+        .await
+        .unwrap_or_default()
+}
+
+fn emit_fence_drift(paths: &[String], emit: &mut dyn FnMut(SeatEventKind)) {
+    for path in paths {
+        emit(SeatEventKind::Fence {
+            kind: "drift".to_string(),
+            path: path.clone(),
+            tool: String::new(),
+        });
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn apply_post_drive_fence(
+    request: &SeatRequest,
+    cwd: &Path,
+    allowed_extra: &[PathBuf],
+    protected_roots: &[PathBuf],
+    protected_before: Option<&Digest>,
+    mut result: SeatResult,
+    mut flags: DriveFlags,
+    context_changes: Vec<crate::protocol::ContextChange>,
+    attempts: u32,
+    wall_start: Instant,
+    client: &Client,
+    live_agent: Option<&Agent>,
+    agent_id: &str,
+    handles: &Handles<'_>,
+    inbox: &mut Inbox,
+    session: &mut Option<SessionStore>,
+    guard_tools: bool,
+    emit: &mut dyn FnMut(SeatEventKind),
+) -> (SeatResult, DriveFlags) {
+    if let Some(before) = protected_before {
+        let after = snapshot_async(protected_roots, &request.fence, cwd).await;
+        let paths = changed(before, &after);
+        if !paths.is_empty() {
+            result = fence_escape_result(
+                request,
+                &paths
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                &result,
+                attempts,
+                wall_start,
+                context_changes,
+                session,
+            );
+        }
+    }
+
+    if result.outcome == Outcome::Ok && !request.fence.is_empty() {
+        let mut drift_paths = drift(cwd, &request.fence).await;
+        if !drift_paths.is_empty() {
+            emit_fence_drift(&drift_paths, emit);
+            let listing = drift_paths.join("\n");
+            let followup = format!(
+                "These paths in the workspace are outside the packet fence and must be \
+                 reverted or removed before the run can succeed:\n{listing}\n\
+                 Revert or delete them, then end the turn."
+            );
+            record(session, |store| store.set_state(OpState::Awaiting));
+            let owned_agent;
+            let sender = if let Some(agent) = live_agent {
+                agent
+            } else {
+                owned_agent = client.agent(agent_id.to_string());
+                &owned_agent
+            };
+            match sender.send_with(followup, SendOptions::new()).await {
+                Ok(next) => {
+                    let (next_result, next_flags) = drive(
+                        request,
+                        handles,
+                        next,
+                        inbox,
+                        session,
+                        None,
+                        Vec::new(),
+                        attempts,
+                        wall_start,
+                        emit,
+                        DriveFence {
+                            cwd: cwd.to_path_buf(),
+                            allowed_extra: allowed_extra.to_vec(),
+                            guard_tools,
+                        },
+                    )
+                    .await;
+                    result = next_result;
+                    flags = next_flags;
+                    if result.outcome == Outcome::Ok {
+                        drift_paths = drift(cwd, &request.fence).await;
+                    }
+                    if result.outcome == Outcome::Ok && !drift_paths.is_empty() {
+                        emit_fence_drift(&drift_paths, emit);
+                        result = fence_drift_result(
+                            request,
+                            &drift_paths.join("\n"),
+                            &result,
+                            attempts,
+                            wall_start,
+                            session,
+                        );
+                    }
+                }
+                Err(_) => {
+                    result = fence_drift_result(
+                        request,
+                        &listing,
+                        &result,
+                        attempts,
+                        wall_start,
+                        session,
+                    );
+                }
+            }
+        }
+    }
+
+    (result, flags)
 }
 
 fn tool_fence_hit(
