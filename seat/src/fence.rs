@@ -471,6 +471,45 @@ fn lexical_relative_shell_path(token: &str, base: &Path) -> PathBuf {
     lexically_normalize(&join_base(token.trim(), base))
 }
 
+fn resolve_shell_candidate_path(candidate: &str, lexical_base: &Path) -> Option<PathBuf> {
+    if is_absolute_or_home_spelling(candidate) {
+        lexical_shell_path(candidate)
+    } else if is_relative_path_spelling(candidate) {
+        Some(lexical_relative_shell_path(candidate, lexical_base))
+    } else {
+        None
+    }
+}
+
+fn is_cd_builtin(token: &str) -> bool {
+    token.eq_ignore_ascii_case("cd") || token.eq_ignore_ascii_case("pushd")
+}
+
+fn shell_skip_token(token: &str) -> bool {
+    let t = token.trim();
+    t.is_empty() || t == "&" || t == "&&" || t == ";" || t == "|"
+}
+
+fn next_shell_arg(tokens: &[String], from: usize) -> Option<(String, usize)> {
+    let mut i = from;
+    while i < tokens.len() {
+        if shell_skip_token(&tokens[i]) {
+            i += 1;
+            continue;
+        }
+        return Some((tokens[i].clone(), i + 1));
+    }
+    None
+}
+
+fn apply_cd_to_lexical_base(path_token: &str, lexical_base: &Path) -> PathBuf {
+    if let Some(path) = resolve_shell_candidate_path(path_token, lexical_base) {
+        path
+    } else {
+        lexical_relative_shell_path(path_token, lexical_base)
+    }
+}
+
 fn shell_command_protected_escape(
     cmd: &str,
     effective_cwd: &Path,
@@ -478,16 +517,32 @@ fn shell_command_protected_escape(
     allowed_extra: &[PathBuf],
     protected_roots: &[PathBuf],
 ) -> Option<PathBuf> {
-    for token in tokenize_shell_command(cmd) {
-        for candidate in path_candidates_from_token(&token) {
-            let paths: Vec<PathBuf> = if is_absolute_or_home_spelling(&candidate) {
-                lexical_shell_path(&candidate).into_iter().collect()
-            } else if is_relative_path_spelling(&candidate) {
-                vec![lexical_relative_shell_path(&candidate, effective_cwd)]
-            } else {
-                continue;
-            };
-            for path in paths {
+    let tokens = tokenize_shell_command(cmd);
+    let mut lexical_base = effective_cwd.to_path_buf();
+    let mut i = 0;
+    while i < tokens.len() {
+        if is_cd_builtin(&tokens[i]) {
+            i += 1;
+            if let Some((path_token, next)) = next_shell_arg(&tokens, i) {
+                for candidate in path_candidates_from_token(&path_token) {
+                    if let Some(path) = resolve_shell_candidate_path(&candidate, &lexical_base) {
+                        if let Some(hit) = hits_protected_root(
+                            &path,
+                            protected_roots,
+                            worktree_cwd,
+                            allowed_extra,
+                        ) {
+                            return Some(hit);
+                        }
+                    }
+                }
+                lexical_base = apply_cd_to_lexical_base(&path_token, &lexical_base);
+                i = next;
+            }
+            continue;
+        }
+        for candidate in path_candidates_from_token(&tokens[i]) {
+            if let Some(path) = resolve_shell_candidate_path(&candidate, &lexical_base) {
                 if let Some(hit) =
                     hits_protected_root(&path, protected_roots, worktree_cwd, allowed_extra)
                 {
@@ -495,6 +550,7 @@ fn shell_command_protected_escape(
                 }
             }
         }
+        i += 1;
     }
     None
 }
@@ -1418,6 +1474,20 @@ mod tests {
         .unwrap()
         .clone();
         assert!(tool_escape("shell", &args, &cwd, &[], &[]).is_some());
+    }
+
+    #[test]
+    fn shell_cd_updates_lexical_base_for_later_tokens() {
+        let root = unique_temp("cd-track-root");
+        let primary = root.join("primary");
+        let wt = root.join("wt");
+        fs::create_dir_all(wt.join("seat")).unwrap();
+        fs::create_dir_all(&primary).unwrap();
+        fs::write(primary.join("file"), b"x").unwrap();
+        assert!(shell_hit("cd seat && cp ../../primary/file .", &wt, &[primary.clone()]).is_some());
+        fs::write(wt.join("README.md"), b"r").unwrap();
+        let outside = unique_temp("cd-track-other");
+        assert!(shell_hit("cd seat && cat ../README.md", &wt, &[outside]).is_none());
     }
 
     #[test]

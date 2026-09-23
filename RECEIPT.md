@@ -42,6 +42,20 @@
 - `shell_path_colon_field_into_root_bounces`
 - `fence_escape_latch_single_cancel_and_event`
 
+## Review round 2
+
+| Finding | Fix | Test |
+|---------|-----|------|
+| `call_id` dedup dropped completion frames | `fence_checked_tool_calls` skips only `tool_fence_hit`; `emit_message` dedupes `{call_id}:{status}`; snapshot after every tool_call | `tool_call_started_and_completed_both_emit`, `tool_call_completion_runs_protected_snapshot_when_due` |
+| `cd`/`pushd` lexical base | Left-to-right walk updates base; `cd` targets checked for escape | `shell_cd_updates_lexical_base_for_later_tokens` |
+| PROTOCOL relative + cd rules | Documented in fence section | (docs only) |
+
+## New tests (round 2)
+
+- `shell_cd_updates_lexical_base_for_later_tokens` (unit)
+- `tool_call_started_and_completed_both_emit` (integration)
+- `tool_call_completion_runs_protected_snapshot_when_due` (integration)
+
 ## Gate (second run tail)
 
 ```

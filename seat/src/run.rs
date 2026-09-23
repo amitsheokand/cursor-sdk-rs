@@ -1023,12 +1023,10 @@ async fn drive(
                 match event {
                     Some(Ok(RunEvent::Message(message))) => {
                         observe_ids(handles, message.run_id(), &mut state, session, emit).await;
-                        if message.kind.as_str() == "tool_call"
-                            && tool_call_is_replay(&message, &mut state)
-                        {
-                            continue;
-                        }
-                        if fence.guard_tools {
+                        let is_tool_call = message.kind.as_str() == "tool_call";
+                        let skip_fence_check =
+                            is_tool_call && tool_call_fence_already_checked(&message, &mut state);
+                        if fence.guard_tools && !skip_fence_check {
                             if let Some(path) = tool_fence_hit(
                                 &message,
                                 &fence.cwd,
@@ -1045,22 +1043,19 @@ async fn drive(
                                     emit,
                                 )
                                 .await;
-                            } else {
-                                let is_tool_call = message.kind.as_str() == "tool_call";
-                                emit_message(message, &mut state, emit);
-                                if is_tool_call {
-                                    maybe_protected_snapshot_escape(
-                                        &fence,
-                                        &mut state,
-                                        handles,
-                                        session,
-                                        emit,
-                                    )
-                                    .await;
-                                }
+                                continue;
                             }
-                        } else {
-                            emit_message(message, &mut state, emit);
+                        }
+                        emit_message(message, &mut state, emit);
+                        if fence.guard_tools && is_tool_call {
+                            maybe_protected_snapshot_escape(
+                                &fence,
+                                &mut state,
+                                handles,
+                                session,
+                                emit,
+                            )
+                            .await;
                         }
                     }
                     Some(Ok(RunEvent::Completed(outcome))) => break *outcome,
@@ -1173,6 +1168,7 @@ struct DriveState {
     resumptions: u32,
     fence_escape: Option<String>,
     last_protected_snapshot: Option<Instant>,
+    fence_checked_tool_calls: HashSet<String>,
 }
 
 /// Record run/agent ids; on first sight emit `run_started` and fire a
@@ -1394,14 +1390,17 @@ fn tool_fence_hit(
     crate::fence::tool_escape(&name, &args, cwd, allowed_extra, protected_roots)
 }
 
-fn tool_call_is_replay(message: &StreamMessage, state: &mut DriveState) -> bool {
+/// Live fence runs once per `call_id` (started frame with args); completion replays skip re-check.
+fn tool_call_fence_already_checked(message: &StreamMessage, state: &mut DriveState) -> bool {
     let call_id = str_field(message, "call_id")
         .or_else(|| str_field(message, "callId"))
         .unwrap_or_default();
     if call_id.is_empty() {
         return false;
     }
-    !state.seen_tool_calls.insert(call_id.to_string())
+    !state
+        .fence_checked_tool_calls
+        .insert(call_id.to_string())
 }
 
 async fn emit_fence_escape(
@@ -1577,6 +1576,16 @@ fn emit_message(
                 .or_else(|| str_field(&message, "callId"))
                 .unwrap_or_default()
                 .to_string();
+            let dedupe_key = if call_id.is_empty() {
+                None
+            } else {
+                Some(format!("{call_id}:{status}"))
+            };
+            if let Some(key) = dedupe_key {
+                if !state.seen_tool_calls.insert(key) {
+                    return;
+                }
+            }
             emit(SeatEventKind::ToolCall {
                 label,
                 status,

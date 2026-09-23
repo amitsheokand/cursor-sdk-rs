@@ -80,9 +80,12 @@ run failures arrives in P4. Controls arriving after the result are moot
   seat also tokenizes the command string (`command` / `cmd` / `script`, including
   nested `arguments`) on whitespace and shell metacharacters, and treats
   absolute or home-relative tokens (and `KEY=value` / `--flag=value` path
-  suffixes) as path candidates. A candidate escapes when it lies under a
-  `protected_root` and is not under `cwd` or `session_dir` (lexical token
-  normalization only — no symlink follow on command tokens).
+  suffixes) as path candidates. Relative tokens are joined to the effective
+  shell `cwd` (from shell args when set, else the worktree `cwd`), then
+  lexically normalized without following symlinks. Within one command, `cd`
+  / `pushd` updates that lexical base for later tokens (left to right). A
+  candidate escapes when it lies under a `protected_root` and is not under
+  `cwd` or `session_dir`.
 - During the drive loop, protected-root snapshots are re-run after each
   `tool_call` (debounced to at most once per second) and on every heartbeat
   tick; any change from the pre-run baseline emits `fence` `escape` and
