@@ -134,6 +134,23 @@ fn init_git_repo(dir: &PathBuf) {
         .expect("git config name");
 }
 
+/// Commits `rel` at HEAD in `cwd`, then leaves the worktree file at `agent_bytes`.
+fn git_head_then_agent_edit(cwd: &PathBuf, rel: &str, head_bytes: &[u8], agent_bytes: &[u8]) {
+    init_git_repo(cwd);
+    fs::write(cwd.join(rel), head_bytes).unwrap();
+    Command::new("git")
+        .args(["add", rel])
+        .current_dir(cwd)
+        .output()
+        .expect("git add");
+    Command::new("git")
+        .args(["commit", "-m", "base"])
+        .current_dir(cwd)
+        .output()
+        .expect("git commit");
+    fs::write(cwd.join(rel), agent_bytes).unwrap();
+}
+
 #[tokio::test]
 async fn edit_outside_cwd_bounces_and_cancels() {
     let cwd = workspace_dir();
@@ -347,7 +364,7 @@ async fn tool_call_completion_runs_protected_snapshot_when_due() {
     let protected = workspace_dir();
     let tracked = protected.join("mirror.txt");
     let agent_body = b"agent-copy";
-    fs::write(cwd.join("mirror.txt"), agent_body).unwrap();
+    git_head_then_agent_edit(&cwd, "mirror.txt", b"before", agent_body);
     fs::write(&tracked, b"before").unwrap();
 
     let bridge = FakeBridge::start().await;
@@ -492,7 +509,7 @@ async fn protected_root_midrun_escape_after_tool_call() {
     let protected = workspace_dir();
     let tracked = protected.join("mirror.txt");
     let agent_body = b"agent-copy";
-    fs::write(cwd.join("mirror.txt"), agent_body).unwrap();
+    git_head_then_agent_edit(&cwd, "mirror.txt", b"before", agent_body);
     fs::write(&tracked, b"before").unwrap();
 
     let bridge = FakeBridge::start().await;
@@ -1018,7 +1035,7 @@ async fn protected_root_external_then_agent_copy_escapes() {
     let protected = workspace_dir();
     let tracked = protected.join("mirror.txt");
     let agent_body = b"agent-copy";
-    fs::write(cwd.join("mirror.txt"), agent_body).unwrap();
+    git_head_then_agent_edit(&cwd, "mirror.txt", b"before", agent_body);
     fs::write(&tracked, b"before").unwrap();
 
     let bridge = FakeBridge::start().await;

@@ -822,6 +822,50 @@ fn is_regular_file(path: &Path) -> bool {
         .is_some_and(|meta| meta.file_type().is_file() && !meta.file_type().is_symlink())
 }
 
+fn hash_bytes(bytes: &[u8]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn rel_path_git_spec(rel: &Path) -> String {
+    rel.components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// `Ok(None)` when `rel` is absent at HEAD; `Err` when git fails.
+fn git_head_bytes(cwd: &Path, rel: &Path) -> Result<Option<Vec<u8>>, ()> {
+    use std::process::Command;
+    let spec = format!("HEAD:{}", rel_path_git_spec(rel));
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .arg("show")
+        .arg(&spec)
+        .output()
+        .map_err(|_| ())?;
+    if output.status.success() {
+        return Ok(Some(output.stdout));
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if stderr.contains("does not exist") || stderr.contains("exists on disk") {
+        return Ok(None);
+    }
+    Err(())
+}
+
+/// Worktree file differs from `git HEAD:<rel>` (or is new at HEAD). Git failure → not authored.
+fn worktree_file_agent_authored(cwd: &Path, rel: &Path, worktree_copy: &Path) -> bool {
+    let worktree_hash = content_hash(worktree_copy);
+    match git_head_bytes(cwd, rel) {
+        Err(()) => false,
+        Ok(None) => true,
+        Ok(Some(head_bytes)) => worktree_hash != hash_bytes(&head_bytes),
+    }
+}
+
 /// Classify protected-root snapshot deltas: agent copy (worktree hash match) vs external.
 pub fn attribute(
     changed: &[PathBuf],
@@ -850,7 +894,11 @@ pub fn attribute(
             continue;
         };
         if protected_meta.content_hash == content_hash(&worktree_copy) {
-            escapes.push(path.clone());
+            if worktree_file_agent_authored(cwd, rel, &worktree_copy) {
+                escapes.push(path.clone());
+            } else {
+                external.push(path.clone());
+            }
         } else {
             external.push(path.clone());
         }
@@ -1099,6 +1147,19 @@ mod tests {
             .expect("git config");
     }
 
+    fn git_commit_all(dir: &Path, message: &str) {
+        Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(dir)
+            .output()
+            .expect("git add");
+        Command::new("git")
+            .args(["commit", "-m", message])
+            .current_dir(dir)
+            .output()
+            .expect("git commit");
+    }
+
     #[test]
     fn tool_escape_blocks_edit_outside_cwd() {
         let cwd = unique_temp("fence-cwd");
@@ -1136,11 +1197,50 @@ mod tests {
     fn attribute_worktree_copy_is_escape() {
         let wt = unique_temp("attr-wt");
         let root = unique_temp("attr-root");
+        init_git(&wt);
+        fs::write(wt.join("f.txt"), b"head").unwrap();
+        git_commit_all(&wt, "base");
         fs::write(wt.join("f.txt"), b"same").unwrap();
         fs::write(root.join("f.txt"), b"old").unwrap();
         let roots = vec![root.clone()];
         let before = snapshot(&roots, &["f.txt".into()], &wt);
         fs::write(root.join("f.txt"), b"same").unwrap();
+        let after = snapshot(&roots, &["f.txt".into()], &wt);
+        let delta = changed(&before, &after);
+        let (escapes, external) = attribute(&delta, &after, &roots, &wt);
+        assert_eq!(external, Vec::<PathBuf>::new());
+        assert_eq!(escapes, vec![root.join("f.txt")]);
+    }
+
+    #[test]
+    fn attribute_primary_revert_to_head_while_worktree_clean_is_external() {
+        let wt = unique_temp("attr-wt-revert");
+        let root = unique_temp("attr-root-revert");
+        init_git(&wt);
+        fs::write(wt.join("f.txt"), b"head").unwrap();
+        git_commit_all(&wt, "base");
+        fs::write(root.join("f.txt"), b"dirty").unwrap();
+        let roots = vec![root.clone()];
+        let before = snapshot(&roots, &["f.txt".into()], &wt);
+        fs::write(root.join("f.txt"), b"head").unwrap();
+        let after = snapshot(&roots, &["f.txt".into()], &wt);
+        let delta = changed(&before, &after);
+        let (escapes, external) = attribute(&delta, &after, &roots, &wt);
+        assert!(escapes.is_empty());
+        assert_eq!(external, vec![root.join("f.txt")]);
+    }
+
+    #[test]
+    fn attribute_new_untracked_worktree_copy_is_escape() {
+        let wt = unique_temp("attr-wt-new");
+        let root = unique_temp("attr-root-new");
+        init_git(&wt);
+        fs::write(wt.join("README.md"), b"init").unwrap();
+        git_commit_all(&wt, "empty");
+        fs::write(wt.join("f.txt"), b"new-agent").unwrap();
+        let roots = vec![root.clone()];
+        let before = snapshot(&roots, &["f.txt".into()], &wt);
+        fs::write(root.join("f.txt"), b"new-agent").unwrap();
         let after = snapshot(&roots, &["f.txt".into()], &wt);
         let delta = changed(&before, &after);
         let (escapes, external) = attribute(&delta, &after, &roots, &wt);

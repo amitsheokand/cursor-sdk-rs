@@ -91,7 +91,11 @@ run failures arrives in P4. Controls arriving after the result are moot
   `tool_call` (debounced to at most once per second) and on every heartbeat
   tick. Changes from the baseline are attributed: if a changed protected file
   is a regular file whose content hash matches the worktree copy at the same
-  relative path, that is an agent copy (`fence` `escape`, run cancelled). Any
+  relative path **and** the worktree copy is agent-authored (its hash differs
+  from `git HEAD:<rel>` in the worktree, or the path is new at HEAD), that is an
+  agent copy (`fence` `escape`, run cancelled). A hash match where the worktree
+  still matches HEAD (e.g. owner `git checkout --` on the primary) is
+  `external`. Git errors during that check fail open to `external`. Any
   other change (different content, deletion, symlink, missing worktree file) is
   external: one `fence` `external` event per path, baseline updated so the same
   edit is not re-reported, outcome unchanged. The post-drive snapshot uses the
