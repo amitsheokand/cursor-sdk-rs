@@ -8,6 +8,8 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
@@ -398,4 +400,14 @@ pub fn client_for(bridge: &FakeBridge) -> cursor_sdk::Client {
         .api_key("test-api-key")
         .endpoint(&bridge.url, &bridge.token)
         .build()
+}
+
+static WORKSPACE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Fresh absolute directory for a seat `cwd` (must exist for validation).
+pub fn workspace_dir() -> PathBuf {
+    let n = WORKSPACE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("cursor-seat-ws-{n}"));
+    std::fs::create_dir_all(&dir).expect("workspace dir");
+    dir
 }

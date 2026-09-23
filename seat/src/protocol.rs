@@ -9,6 +9,7 @@
 //! Golden JSON tests in `tests/protocol_golden.rs` pin the wire shape.
 
 use std::collections::HashMap;
+use std::path::Path;
 
 /// Protocol version. `SeatRequest.v` must equal this.
 pub const PROTOCOL_V: u32 = 1;
@@ -48,11 +49,17 @@ pub struct SeatRequest {
     /// Directory holding `session.jsonl` for the durable run (P5).
     #[serde(default)]
     pub session_dir: Option<String>,
+    /// Worktree-relative paths the agent may touch (file or directory prefix).
+    #[serde(default)]
+    pub fence: Vec<String>,
+    /// Absolute checkouts that must not change under the fence entries.
+    #[serde(default)]
+    pub protected_roots: Vec<String>,
 }
 
 impl SeatRequest {
     /// Minimal validation P0 does before acknowledging the request.
-    pub fn validate(&self) -> Result<(), String> {
+    pub fn validate(&mut self) -> Result<(), String> {
         if self.v != PROTOCOL_V {
             return Err(format!("unsupported protocol v: {}", self.v));
         }
@@ -62,6 +69,16 @@ impl SeatRequest {
         if self.cwd.is_empty() {
             return Err("cwd is empty".to_string());
         }
+        let cwd = Path::new(&self.cwd);
+        if !cwd.is_absolute() {
+            return Err("cwd must be an absolute path".to_string());
+        }
+        let canonical = std::fs::canonicalize(cwd)
+            .map_err(|e| format!("cwd is not an existing directory: {e}"))?;
+        if !canonical.is_dir() {
+            return Err("cwd is not a directory".to_string());
+        }
+        self.cwd = canonical.to_string_lossy().into_owned();
         if self.model.id.is_empty() {
             return Err("model.id is empty".to_string());
         }
@@ -245,6 +262,11 @@ pub enum SeatEventKind {
         verdict: String,
         p: f64,
     },
+    Fence {
+        kind: String,
+        path: String,
+        tool: String,
+    },
     Result(SeatResult),
 }
 
@@ -350,7 +372,10 @@ mod tests {
 
     #[test]
     fn request_validation_enforces_task_law() {
+        let dir = std::env::temp_dir().join("cursor-seat-validate-task");
+        let _ = std::fs::create_dir_all(&dir);
         let mut req = minimal_request();
+        req.cwd = dir.to_string_lossy().into_owned();
         assert!(req.validate().is_ok());
         req.disallowed_tools = vec!["other".into()];
         assert!(req.validate().is_err());
@@ -386,6 +411,8 @@ mod tests {
                 heartbeat_s: 30,
             },
             session_dir: None,
+            fence: vec![],
+            protected_roots: vec![],
         }
     }
 }

@@ -17,7 +17,7 @@
 //! the stream (with replay dedup) instead of re-sending.
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -29,6 +29,7 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 
 use crate::clip::{archive_text, bound_output, bound_output_with_path};
+use crate::fence::{changed, drift, snapshot};
 use crate::context::build_context;
 use crate::inbox::Inbox;
 use crate::jev::{
@@ -66,7 +67,7 @@ const MAX_RESUMES: u32 = 3;
 /// a full disk would be worse than a weakened at-most-once guarantee.
 pub async fn run_seat(
     client: &Client,
-    request: SeatRequest,
+    mut request: SeatRequest,
     mut inbox: Inbox,
     events: mpsc::UnboundedSender<SeatEvent>,
     mut session: Option<SessionStore>,
@@ -130,7 +131,6 @@ pub async fn run_seat(
     // MCP servers are filtered always; custom tools only restrict an
     // explicit allowlist (built-in names are unreliable to enumerate).
     let mut pruned: Option<HashSet<String>> = None;
-    let mut request = request;
     if request.jev.prune_tools {
         if let Some(jev) = seat_tools.jev.as_ref() {
             let mut candidates: Vec<PruneCandidate> = request
@@ -333,6 +333,25 @@ pub async fn run_seat(
         }
     };
 
+    let cwd = PathBuf::from(&request.cwd);
+    let allowed_extra: Vec<PathBuf> = request
+        .session_dir
+        .as_deref()
+        .map(PathBuf::from)
+        .into_iter()
+        .collect();
+    let guard_tools = !request.fence.is_empty() || !request.protected_roots.is_empty();
+    let protected_roots: Vec<PathBuf> = request
+        .protected_roots
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+    let protected_before = if protected_roots.is_empty() {
+        None
+    } else {
+        Some(snapshot(&protected_roots, &request.fence))
+    };
+
     // Phase D: open the stream on the same agent across retries.
     let run = match retry_op(&key, policy, &mut attempts, || {
         agent.send_with(built.text.clone(), SendOptions::new())
@@ -376,8 +395,95 @@ pub async fn run_seat(
         attempts,
         wall_start,
         &mut emit,
+        DriveFence {
+            cwd: cwd.clone(),
+            allowed_extra: allowed_extra.clone(),
+            guard_tools,
+        },
     )
     .await;
+
+    if let Some(before) = protected_before.as_ref() {
+        let after = snapshot(&protected_roots, &request.fence);
+        let paths = changed(before, &after);
+        if !paths.is_empty() {
+            result = fence_escape_result(
+                &request,
+                &paths
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                &result,
+                attempts,
+                wall_start,
+                built.changes.clone(),
+                &mut session,
+            );
+        }
+    }
+
+    if result.outcome == Outcome::Ok && !request.fence.is_empty() {
+        let mut drift_paths = drift(&cwd, &request.fence).await;
+        if !drift_paths.is_empty() {
+            let listing = drift_paths.join("\n");
+            let followup = format!(
+                "These paths in the workspace are outside the packet fence and must be \
+                 reverted or removed before the run can succeed:\n{listing}\n\
+                 Revert or delete them, then end the turn."
+            );
+            record(&mut session, |store| store.set_state(OpState::Awaiting));
+            match agent.send_with(followup, SendOptions::new()).await {
+                Ok(next) => {
+                    let (next_result, next_flags) = drive(
+                        &request,
+                        &handles,
+                        next,
+                        &mut inbox,
+                        &mut session,
+                        None,
+                        Vec::new(),
+                        attempts,
+                        wall_start,
+                        &mut emit,
+                        DriveFence {
+                            cwd: cwd.clone(),
+                            allowed_extra: allowed_extra.clone(),
+                            guard_tools,
+                        },
+                    )
+                    .await;
+                    result = next_result;
+                    flags = next_flags;
+                    if result.outcome != Outcome::Ok {
+                        // The correction turn failed; drift is moot.
+                    } else {
+                        drift_paths = drift(&cwd, &request.fence).await;
+                    }
+                    if result.outcome == Outcome::Ok && !drift_paths.is_empty() {
+                        result = fence_drift_result(
+                            &request,
+                            &drift_paths.join("\n"),
+                            &result,
+                            attempts,
+                            wall_start,
+                            &mut session,
+                        );
+                    }
+                }
+                Err(_) => {
+                    result = fence_drift_result(
+                        &request,
+                        &listing,
+                        &result,
+                        attempts,
+                        wall_start,
+                        &mut session,
+                    );
+                }
+            }
+        }
+    }
 
     // P6 self-check: same-agent follow-up turns while the receipt check
     // fails. Only on success (a failed turn belongs to the drain's steer
@@ -453,6 +559,11 @@ pub async fn run_seat(
                                     attempts,
                                     wall_start,
                                     &mut emit,
+                                    DriveFence {
+                                        cwd: cwd.clone(),
+                                        allowed_extra: allowed_extra.clone(),
+                                        guard_tools,
+                                    },
                                 )
                                 .await;
                                 result = next_result;
@@ -805,6 +916,14 @@ async fn attach(
             };
             // No self-check on attach: there is no agent handle for a
             // follow-up send, so the attached outcome stands as-is.
+            let cwd = PathBuf::from(&request.cwd);
+            let allowed_extra: Vec<PathBuf> = request
+                .session_dir
+                .as_deref()
+                .map(PathBuf::from)
+                .into_iter()
+                .collect();
+            let guard_tools = !request.fence.is_empty() || !request.protected_roots.is_empty();
             let (result, _) = drive(
                 request,
                 &handles,
@@ -816,6 +935,11 @@ async fn attach(
                 attempts,
                 wall_start,
                 emit,
+                DriveFence {
+                    cwd,
+                    allowed_extra,
+                    guard_tools,
+                },
             )
             .await;
             result
@@ -839,6 +963,13 @@ async fn attach(
     maybe_triage(attach_jev.as_ref(), &result, emit).await;
     emit(SeatEventKind::Result(result.clone()));
     result
+}
+
+/// Tool-path fence inputs for the drive loop.
+struct DriveFence {
+    cwd: PathBuf,
+    allowed_extra: Vec<PathBuf>,
+    guard_tools: bool,
 }
 
 /// Flags the drive loop hands back for post-turn decisions.
@@ -872,6 +1003,7 @@ async fn drive(
     attempts: u32,
     wall_start: Instant,
     emit: &mut dyn FnMut(SeatEventKind),
+    fence: DriveFence,
 ) -> (SeatResult, DriveFlags) {
     let heartbeat = Duration::from_secs(request.limits.heartbeat_s);
     let deadline = wall_start + Duration::from_secs(request.limits.timeout_s);
@@ -904,7 +1036,28 @@ async fn drive(
                 match event {
                     Some(Ok(RunEvent::Message(message))) => {
                         observe_ids(handles, message.run_id(), &mut state, session, emit).await;
-                        emit_message(message, &mut state, emit);
+                        if fence.guard_tools {
+                            if let Some(path) = tool_fence_hit(&message, &fence.cwd, &fence.allowed_extra) {
+                                let tool = tool_label(&message);
+                                emit(SeatEventKind::Fence {
+                                    kind: "escape".to_string(),
+                                    path: path.display().to_string(),
+                                    tool,
+                                });
+                                state.fence_escape = Some(path.display().to_string());
+                                state.pending_cancel = true;
+                                if state.run_id.is_some() {
+                                    record(session, |store| store.set_state(OpState::Canceling));
+                                    handles
+                                        .cancel_run(state.run_id.as_deref().unwrap_or_default())
+                                        .await;
+                                }
+                            } else {
+                                emit_message(message, &mut state, emit);
+                            }
+                        } else {
+                            emit_message(message, &mut state, emit);
+                        }
                     }
                     Some(Ok(RunEvent::Completed(outcome))) => break *outcome,
                     Some(Ok(_)) => {}
@@ -966,7 +1119,20 @@ async fn drive(
         }
     };
 
-    let result = finish(request, outcome, &state, attempts, wall_start, context_changes, handles, session).await;
+    let mut result =
+        finish(request, outcome, &state, attempts, wall_start, context_changes, handles, session)
+            .await;
+    if let Some(path) = state.fence_escape.clone() {
+        result = fence_escape_result(
+            request,
+            &path,
+            &result,
+            attempts,
+            wall_start,
+            result.context_changes.clone(),
+            session,
+        );
+    }
     (result, DriveFlags::from(&state))
 }
 
@@ -991,6 +1157,7 @@ struct DriveState {
     start: Option<Instant>,
     resumed: bool,
     resumptions: u32,
+    fence_escape: Option<String>,
 }
 
 /// Record run/agent ids; on first sight emit `run_started` and fire a
@@ -1059,6 +1226,93 @@ async fn apply_control(
         }
         ControlMode::Heartbeat => {}
     }
+}
+
+fn tool_fence_hit(
+    message: &StreamMessage,
+    cwd: &Path,
+    allowed_extra: &[PathBuf],
+) -> Option<PathBuf> {
+    if message.kind.as_str() != "tool_call" {
+        return None;
+    }
+    let (name, args) = crate::fence::tool_args_from_message(message);
+    crate::fence::tool_escape(&name, &args, cwd, allowed_extra)
+}
+
+fn fence_escape_result(
+    request: &SeatRequest,
+    path_text: &str,
+    prior: &SeatResult,
+    attempts: u32,
+    wall_start: Instant,
+    context_changes: Vec<crate::protocol::ContextChange>,
+    session: &mut Option<SessionStore>,
+) -> SeatResult {
+    let text = format!("fence escape: {path_text}");
+    let (text, _) = bound_output(&text, request.limits.clip_chars);
+    let result = SeatResult {
+        outcome: Outcome::Bounced,
+        status: "fence_escape".to_string(),
+        error_kind: Some("FenceEscape".to_string()),
+        retryable: false,
+        retry_after_ms: None,
+        request_id: request.request_id.clone(),
+        run_id: prior.run_id.clone(),
+        agent_id: prior.agent_id.clone(),
+        model: Some(request.model.id.clone()),
+        text,
+        archive_path: None,
+        wall_ms: wall_start.elapsed().as_millis() as u64,
+        ttfe_ms: prior.ttfe_ms,
+        usage: prior.usage.clone(),
+        attempts,
+        self_check: None,
+        context_changes,
+        resumed: prior.resumed,
+    };
+    record(session, |store| {
+        store.record_result(&result)?;
+        store.set_state(OpState::Failed)
+    });
+    result
+}
+
+fn fence_drift_result(
+    request: &SeatRequest,
+    path_listing: &str,
+    prior: &SeatResult,
+    attempts: u32,
+    wall_start: Instant,
+    session: &mut Option<SessionStore>,
+) -> SeatResult {
+    let text = format!("fence drift:\n{path_listing}");
+    let (text, _) = bound_output(&text, request.limits.clip_chars);
+    let result = SeatResult {
+        outcome: Outcome::Failed,
+        status: "fence_drift".to_string(),
+        error_kind: Some("FenceDrift".to_string()),
+        retryable: false,
+        retry_after_ms: None,
+        request_id: request.request_id.clone(),
+        run_id: prior.run_id.clone(),
+        agent_id: prior.agent_id.clone(),
+        model: Some(request.model.id.clone()),
+        text,
+        archive_path: None,
+        wall_ms: wall_start.elapsed().as_millis() as u64,
+        ttfe_ms: prior.ttfe_ms,
+        usage: prior.usage.clone(),
+        attempts,
+        self_check: None,
+        context_changes: prior.context_changes.clone(),
+        resumed: prior.resumed,
+    };
+    record(session, |store| {
+        store.record_result(&result)?;
+        store.set_state(OpState::Failed)
+    });
+    result
 }
 
 /// Map one stream message onto seat events, with replay dedup.

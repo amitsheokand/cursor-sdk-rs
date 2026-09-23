@@ -1,0 +1,470 @@
+//! Fence guard: tool escape, protected roots, git drift.
+
+mod support;
+
+use std::fs;
+use std::path::PathBuf;
+use std::process::Command;
+
+use cursor_seat::inbox::Inbox;
+use cursor_seat::protocol::{
+    Limits, ModelParams, ModelRef, Outcome, PromptPart, SeatEventKind, SeatRequest, SeatResult,
+};
+use cursor_seat::run::run_seat;
+use cursor_sdk::proto;
+use serde_json::json;
+use support::*;
+use tokio::sync::mpsc;
+
+fn fenced_request(cwd: PathBuf, fence: Vec<String>, protected_roots: Vec<String>) -> SeatRequest {
+    SeatRequest {
+        v: 1,
+        request_id: "pkt-fence:1".into(),
+        cwd: cwd.to_string_lossy().into_owned(),
+        model: ModelRef {
+            id: "composer-2.5".into(),
+            params: ModelParams {
+                effort: Some("high".into()),
+                extra: Default::default(),
+            },
+        },
+        prompt: PromptPart {
+            task: "t".into(),
+            effort_tag: "high".into(),
+            body: "body".into(),
+            steer: None,
+        },
+        mcp_servers: vec![],
+        disallowed_tools: vec!["task".into()],
+        tools_enabled: vec![],
+        skill_roots: vec![],
+        jev: Default::default(),
+        limits: Limits {
+            context_chars: 100_000,
+            clip_chars: 40_000,
+            timeout_s: 600,
+            heartbeat_s: 30,
+        },
+        session_dir: None,
+        fence,
+        protected_roots,
+    }
+}
+
+fn script_models_create_close(bridge: &FakeBridge) {
+    bridge.expect(
+        "SdkCursorService/ListModels",
+        Reply::unary(&proto::ListModelsResponse {
+            items: vec![proto::SdkModel {
+                id: "composer-2.5".into(),
+                display_name: "Composer".into(),
+                parameters: vec![proto::ModelParameterDefinition {
+                    id: "effort".into(),
+                    display_name: "Effort".into(),
+                    values: vec![proto::ModelParameterDefinitionValue {
+                        value: "high".into(),
+                        display_name: "high".into(),
+                    }],
+                }],
+                ..Default::default()
+            }],
+        }),
+    );
+    bridge.expect(
+        "SdkAgentService/CreateAgent",
+        Reply::unary(&proto::CreateAgentResponse {
+            agent_id: "agent_1".into(),
+            model: None,
+        }),
+    );
+    bridge.always(
+        "SdkAgentService/CloseAgent",
+        Reply::unary(&proto::CloseAgentResponse {}),
+    );
+}
+
+async fn collect(
+    bridge: &FakeBridge,
+    request: SeatRequest,
+) -> (Vec<cursor_seat::protocol::SeatEvent>, SeatResult) {
+    let client = client_for(bridge);
+    let inbox = Inbox::new(&[]).unwrap();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let run_fut = run_seat(&client, request, inbox, tx, None);
+    tokio::pin!(run_fut);
+    let mut events = Vec::new();
+    let mut result = None;
+    let mut returned = None;
+    loop {
+        tokio::select! {
+            outcome = &mut run_fut, if returned.is_none() => {
+                returned = Some(outcome);
+            }
+            event = rx.recv() => match event {
+                Some(event) => {
+                    if let SeatEventKind::Result(failure) = &event.kind {
+                        result = Some(failure.clone());
+                    }
+                    events.push(event);
+                }
+                None => break,
+            },
+        }
+    }
+    let returned = returned.expect("run_seat returned");
+    (events, result.unwrap_or(returned))
+}
+
+fn init_git_repo(dir: &PathBuf) {
+    Command::new("git")
+        .args(["init"])
+        .current_dir(dir)
+        .output()
+        .expect("git init");
+    Command::new("git")
+        .args(["config", "user.email", "seat@test"])
+        .current_dir(dir)
+        .output()
+        .expect("git config email");
+    Command::new("git")
+        .args(["config", "user.name", "seat"])
+        .current_dir(dir)
+        .output()
+        .expect("git config name");
+}
+
+#[tokio::test]
+async fn edit_outside_cwd_bounces_and_cancels() {
+    let cwd = workspace_dir();
+    let outside = workspace_dir();
+    let bridge = FakeBridge::start().await;
+    script_models_create_close(&bridge);
+    bridge.expect(
+        "SdkAgentService/Send",
+        Reply::Stream(vec![
+            sdk_message_frame(
+                "system",
+                json!({"run_id": "run_1", "agent_id": "agent_1"}),
+                Some("o1"),
+            ),
+            sdk_message_frame(
+                "tool_call",
+                json!({
+                    "name": "edit",
+                    "args": {"path": outside.join("evil.txt").display().to_string()},
+                    "status": "started",
+                    "call_id": "c1",
+                }),
+                Some("o2"),
+            ),
+            result_frame(
+                "agent_1",
+                "run_1",
+                proto::RunLifecycleStatus::Cancelled,
+                "",
+            ),
+            done_frame("agent_1", "run_1"),
+        ]),
+    );
+    bridge.always(
+        "SdkAgentService/CancelRun",
+        Reply::unary(&proto::CancelRunResponse {}),
+    );
+
+    let req = fenced_request(cwd, vec!["src".into()], vec![]);
+    let (events, result) = collect(&bridge, req).await;
+
+    assert_eq!(bridge.call_count("SdkAgentService/CancelRun"), 1);
+    assert_eq!(result.outcome, Outcome::Bounced);
+    assert_eq!(result.status, "fence_escape");
+    assert_eq!(result.error_kind.as_deref(), Some("FenceEscape"));
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(&e.kind, SeatEventKind::Fence { kind, .. } if kind == "escape"))
+    );
+}
+
+#[tokio::test]
+async fn shell_cwd_outside_bounces_and_cancels() {
+    let cwd = workspace_dir();
+    let outside = workspace_dir();
+    let bridge = FakeBridge::start().await;
+    script_models_create_close(&bridge);
+    bridge.expect(
+        "SdkAgentService/Send",
+        Reply::Stream(vec![
+            sdk_message_frame(
+                "system",
+                json!({"run_id": "run_1", "agent_id": "agent_1"}),
+                Some("o1"),
+            ),
+            sdk_message_frame(
+                "tool_call",
+                json!({
+                    "name": "shell",
+                    "args": {"cwd": outside.display().to_string(), "command": "true"},
+                    "status": "started",
+                    "call_id": "c1",
+                }),
+                Some("o2"),
+            ),
+            result_frame(
+                "agent_1",
+                "run_1",
+                proto::RunLifecycleStatus::Cancelled,
+                "",
+            ),
+            done_frame("agent_1", "run_1"),
+        ]),
+    );
+    bridge.always(
+        "SdkAgentService/CancelRun",
+        Reply::unary(&proto::CancelRunResponse {}),
+    );
+
+    let req = fenced_request(cwd, vec!["src".into()], vec![]);
+    let (_, result) = collect(&bridge, req).await;
+
+    assert_eq!(bridge.call_count("SdkAgentService/CancelRun"), 1);
+    assert_eq!(result.outcome, Outcome::Bounced);
+    assert_eq!(result.error_kind.as_deref(), Some("FenceEscape"));
+}
+
+#[tokio::test]
+async fn read_outside_cwd_is_allowed() {
+    let cwd = workspace_dir();
+    let outside = workspace_dir();
+    let bridge = FakeBridge::start().await;
+    script_models_create_close(&bridge);
+    bridge.expect(
+        "SdkAgentService/Send",
+        Reply::Stream(vec![
+            sdk_message_frame(
+                "system",
+                json!({"run_id": "run_1", "agent_id": "agent_1"}),
+                Some("o1"),
+            ),
+            sdk_message_frame(
+                "tool_call",
+                json!({
+                    "name": "read",
+                    "args": {"path": outside.join("file.txt").display().to_string()},
+                    "status": "completed",
+                    "call_id": "c1",
+                }),
+                Some("o2"),
+            ),
+            result_frame(
+                "agent_1",
+                "run_1",
+                proto::RunLifecycleStatus::Finished,
+                "ok",
+            ),
+            done_frame("agent_1", "run_1"),
+        ]),
+    );
+
+    let req = fenced_request(cwd, vec!["src".into()], vec![]);
+    let (_, result) = collect(&bridge, req).await;
+
+    assert_eq!(result.outcome, Outcome::Ok);
+    assert_eq!(bridge.call_count("SdkAgentService/CancelRun"), 0);
+}
+
+#[tokio::test]
+async fn protected_root_change_bounces() {
+    let cwd = workspace_dir();
+    let protected = workspace_dir();
+    let tracked = protected.join("mirror.txt");
+    fs::write(&tracked, b"before").unwrap();
+
+    let bridge = FakeBridge::start().await;
+    script_models_create_close(&bridge);
+    bridge.expect(
+        "SdkAgentService/Send",
+        Reply::Stream(vec![
+            sdk_message_frame(
+                "system",
+                json!({"run_id": "run_1", "agent_id": "agent_1"}),
+                Some("o1"),
+            ),
+            sdk_message_frame(
+                "assistant",
+                json!({"message": {"content": [{"type": "text", "text": "working"}]}}),
+                Some("o2"),
+            ),
+            result_frame(
+                "agent_1",
+                "run_1",
+                proto::RunLifecycleStatus::Finished,
+                "done",
+            ),
+            done_frame("agent_1", "run_1"),
+        ]),
+    );
+
+    let req = fenced_request(
+        cwd,
+        vec!["mirror.txt".into()],
+        vec![protected.to_string_lossy().into_owned()],
+    );
+    let tracked_mut = tracked.clone();
+    let client = client_for(&bridge);
+    let inbox = Inbox::new(&[]).unwrap();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let run_fut = run_seat(&client, req, inbox, tx, None);
+    tokio::pin!(run_fut);
+    let mut result = None;
+    loop {
+        tokio::select! {
+            outcome = &mut run_fut, if result.is_none() => {
+                result = Some(outcome);
+            }
+            event = rx.recv() => match event {
+                Some(event) => {
+                    if matches!(&event.kind, SeatEventKind::RunStarted { .. }) {
+                        fs::write(&tracked_mut, b"after").unwrap();
+                    }
+                    if let SeatEventKind::Result(r) = event.kind {
+                        result = Some(r);
+                    }
+                }
+                None => break,
+            }
+        }
+        if result.is_some() {
+            break;
+        }
+    }
+    let result = result.expect("result");
+    assert_eq!(result.outcome, Outcome::Bounced);
+    assert_eq!(result.error_kind.as_deref(), Some("FenceEscape"));
+}
+
+#[tokio::test]
+async fn out_of_fence_git_drift_gets_one_correction_then_fails() {
+    let cwd = workspace_dir();
+    init_git_repo(&cwd);
+    fs::write(cwd.join("in_fence.txt"), b"ok").unwrap();
+    fs::write(cwd.join("outside.txt"), b"bad").unwrap();
+    Command::new("git")
+        .args(["add", "in_fence.txt"])
+        .current_dir(&cwd)
+        .output()
+        .expect("git add");
+    Command::new("git")
+        .args(["commit", "-m", "init"])
+        .current_dir(&cwd)
+        .output()
+        .expect("git commit");
+
+    let bridge = FakeBridge::start().await;
+    script_models_create_close(&bridge);
+    let happy_end = vec![
+        result_frame(
+            "agent_1",
+            "run_1",
+            proto::RunLifecycleStatus::Finished,
+            "done",
+        ),
+        done_frame("agent_1", "run_1"),
+    ];
+    bridge.expect(
+        "SdkAgentService/Send",
+        Reply::Stream(
+            vec![sdk_message_frame(
+                "system",
+                json!({"run_id": "run_1", "agent_id": "agent_1"}),
+                Some("o1"),
+            )]
+            .into_iter()
+            .chain(happy_end.clone())
+            .collect(),
+        ),
+    );
+    bridge.expect(
+        "SdkAgentService/Send",
+        Reply::Stream(
+            vec![sdk_message_frame(
+                "system",
+                json!({"run_id": "run_2", "agent_id": "agent_1"}),
+                Some("o1"),
+            )]
+            .into_iter()
+            .chain(happy_end)
+            .collect(),
+        ),
+    );
+
+    let req = fenced_request(cwd, vec!["in_fence.txt".into()], vec![]);
+    let (_, result) = collect(&bridge, req).await;
+
+    assert_eq!(bridge.call_count("SdkAgentService/Send"), 2);
+    assert_eq!(result.outcome, Outcome::Failed);
+    assert_eq!(result.status, "fence_drift");
+    assert_eq!(result.error_kind.as_deref(), Some("FenceDrift"));
+}
+
+#[tokio::test]
+async fn in_fence_git_change_stays_ok() {
+    let cwd = workspace_dir();
+    init_git_repo(&cwd);
+    fs::write(cwd.join("allowed.txt"), b"v1").unwrap();
+    Command::new("git")
+        .args(["add", "allowed.txt"])
+        .current_dir(&cwd)
+        .output()
+        .expect("git add");
+    Command::new("git")
+        .args(["commit", "-m", "init"])
+        .current_dir(&cwd)
+        .output()
+        .expect("git commit");
+    fs::write(cwd.join("allowed.txt"), b"v2").unwrap();
+
+    let bridge = FakeBridge::start().await;
+    script_models_create_close(&bridge);
+    bridge.expect(
+        "SdkAgentService/Send",
+        Reply::Stream(vec![
+            sdk_message_frame(
+                "system",
+                json!({"run_id": "run_1", "agent_id": "agent_1"}),
+                Some("o1"),
+            ),
+            result_frame(
+                "agent_1",
+                "run_1",
+                proto::RunLifecycleStatus::Finished,
+                "done",
+            ),
+            done_frame("agent_1", "run_1"),
+        ]),
+    );
+
+    let req = fenced_request(cwd, vec!["allowed.txt".into()], vec![]);
+    let (_, result) = collect(&bridge, req).await;
+
+    assert_eq!(result.outcome, Outcome::Ok);
+    assert_eq!(bridge.call_count("SdkAgentService/Send"), 1);
+}
+
+#[test]
+fn request_without_fence_fields_round_trips() {
+    let raw = json!({
+        "v": 1,
+        "request_id": "pkt-1:1",
+        "cwd": "/unused",
+        "model": {"id": "composer-2.5", "params": {"effort": "high"}},
+        "prompt": {"task": "t", "effort_tag": "high", "body": "b"},
+        "disallowed_tools": ["task"],
+        "limits": {"context_chars": 100000, "timeout_s": 600, "heartbeat_s": 30},
+    });
+    let mut req: SeatRequest = serde_json::from_value(raw).expect("parses");
+    assert!(req.fence.is_empty());
+    assert!(req.protected_roots.is_empty());
+    let dir = workspace_dir();
+    req.cwd = dir.to_string_lossy().into_owned();
+    assert!(req.validate().is_ok());
+}

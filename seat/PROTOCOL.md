@@ -24,7 +24,11 @@ steer}`, `mcp_servers`, `disallowed_tools` always including `task`,
 `tools_enabled` (empty = unrestricted, CLI-like; non-empty is an
 allowlist with the seat tools unioned in), `skill_roots`, `jev {enabled, questions_dir,
 self_check_turns, prune_tools}`, `limits {context_chars, clip_chars=40000,
-timeout_s, heartbeat_s}`, `session_dir`). Unknown fields are rejected.
+timeout_s, heartbeat_s}`, `session_dir`, `fence` (worktree-relative file or
+directory prefix allowlist; default `[]`), `protected_roots` (absolute checkout
+paths that must not change under the fence entries; default `[]`)). Unknown
+fields are rejected. `cwd` must be absolute, exist, and is canonicalized at
+validation.
 
 Later lines are control input (unreal-agent inbox):
 `{id, kind:"control", mode: hard|when_idle|heartbeat|settings, reason,
@@ -70,11 +74,14 @@ run failures arrives in P4. Controls arriving after the result are moot
 - `resumed {run_id}`
 - `jev {check, verdict, p}` (`check` names the TOML question;
   `verdict` is the Choice/Noul outcome; `p` its probability)
+- `fence {kind, path, tool}` (`kind` is `escape` or `drift`; `path` is the
+  offending path; `tool` is the tool name when applicable)
 - final `result`
 
 `result`: `outcome: ok|failed|startup_error|busy|bounced|stale`,
 `status`, `error_kind` (the `ErrorKind` name; a post-start `failed` run
-with no RPC kind reports `Unknown`, which is P6's triage input),
+with no RPC kind reports `Unknown`, which is P6's triage input; fence
+violations use `FenceEscape` or `FenceDrift`),
 `retryable`,
 `retry_after_ms`, `request_id` (full, never truncated), `run_id`,
 `agent_id`, `model`, `text` (clipped), `archive_path`, `wall_ms`,

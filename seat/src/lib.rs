@@ -6,6 +6,7 @@
 
 pub mod clip;
 pub mod context;
+pub mod fence;
 pub mod inbox;
 pub mod jev;
 pub mod protocol;

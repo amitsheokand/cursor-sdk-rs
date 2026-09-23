@@ -41,6 +41,8 @@ fn minimal_request() -> SeatRequest {
             heartbeat_s: 30,
         },
         session_dir: Some("seats/pkt-1:1".into()),
+        fence: vec![],
+        protected_roots: vec![],
     }
 }
 
@@ -56,8 +58,10 @@ fn seat_request_round_trips_with_defaults() {
         "disallowed_tools": ["task"],
         "limits": {"context_chars": 100000, "timeout_s": 600, "heartbeat_s": 30},
     });
-    let req: SeatRequest = serde_json::from_value(raw).expect("parses");
+    let mut req: SeatRequest = serde_json::from_value(raw).expect("parses");
     assert_eq!(req.limits.clip_chars, 40_000);
+    let dir = support::workspace_dir();
+    req.cwd = dir.to_string_lossy().into_owned();
     assert!(req.validate().is_ok());
 
     let again: SeatRequest =
@@ -77,6 +81,8 @@ fn seat_request_rejects_unknown_fields() {
     assert!(serde_json::from_value::<SeatRequest>(params).is_err());
 
     let mut req = minimal_request();
+    let dir = support::workspace_dir();
+    req.cwd = dir.to_string_lossy().into_owned();
     req.v = 999;
     assert!(req.validate().is_err());
 }

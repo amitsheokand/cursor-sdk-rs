@@ -235,6 +235,8 @@ mod tests {
                 heartbeat_s: 30,
             },
             session_dir: None,
+            fence: vec![],
+            protected_roots: vec![],
         }
     }
 

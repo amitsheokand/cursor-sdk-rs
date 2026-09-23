@@ -25,7 +25,7 @@ fn request_with_session(dir: &PathBuf) -> SeatRequest {
     SeatRequest {
         v: 1,
         request_id: "pkt-9:1".into(),
-        cwd: "/repo".into(),
+        cwd: workspace_dir().to_string_lossy().into_owned(),
         model: ModelRef {
             id: "composer-2.5".into(),
             params: ModelParams {
@@ -51,6 +51,8 @@ fn request_with_session(dir: &PathBuf) -> SeatRequest {
             heartbeat_s: 30,
         },
         session_dir: Some(dir.display().to_string()),
+        fence: vec![],
+        protected_roots: vec![],
     }
 }
 

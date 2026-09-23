@@ -56,11 +56,13 @@ async fn run() -> Result<bool, Fatal> {
             "missing SeatRequest on stdin line 1".to_string(),
         ));
     }
-    let request: SeatRequest =
+    let mut request: SeatRequest =
         serde_json::from_str(&first).map_err(|e| Fatal::Failed(format!("invalid SeatRequest: {e}")))?;
     request.validate().map_err(Fatal::Failed)?;
 
-    let client = cursor_sdk::Client::new();
+    let client = cursor_sdk::Client::builder()
+        .workspace(&request.cwd)
+        .build();
     // Durable session first: it seeds inbox dedup across restarts, and a
     // broken log fails closed before any bridge contact.
     let session = match request.session_dir.as_deref() {
