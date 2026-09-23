@@ -5,6 +5,7 @@ mod support;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::Duration;
 
 use cursor_seat::inbox::Inbox;
 use cursor_seat::protocol::{
@@ -336,12 +337,16 @@ async fn protected_root_midrun_escape_after_tool_call() {
 
     let bridge = FakeBridge::start().await;
     script_models_create_close(&bridge);
-    let mut stream_frames = vec![
+    let mut timed = vec![(
+        Duration::ZERO,
         sdk_message_frame(
             "system",
             json!({"run_id": "run_1", "agent_id": "agent_1"}),
             Some("o1"),
         ),
+    )];
+    timed.push((
+        Duration::from_millis(1100),
         sdk_message_frame(
             "tool_call",
             json!({
@@ -352,18 +357,19 @@ async fn protected_root_midrun_escape_after_tool_call() {
             }),
             Some("o2"),
         ),
-    ];
-    stream_frames.extend((0..64).map(|_| keepalive_frame()));
-    stream_frames.push(
+    ));
+    timed.extend((0..32).map(|_| (Duration::ZERO, keepalive_frame())));
+    timed.push((
+        Duration::ZERO,
         result_frame(
             "agent_1",
             "run_1",
             proto::RunLifecycleStatus::Cancelled,
             "",
         ),
-    );
-    stream_frames.push(done_frame("agent_1", "run_1"));
-    bridge.expect("SdkAgentService/Send", Reply::Stream(stream_frames));
+    ));
+    timed.push((Duration::ZERO, done_frame("agent_1", "run_1")));
+    bridge.expect("SdkAgentService/Send", Reply::StreamTimed(timed));
     bridge.always(
         "SdkAgentService/CancelRun",
         Reply::unary(&proto::CancelRunResponse {}),
@@ -384,7 +390,8 @@ async fn protected_root_midrun_escape_after_tool_call() {
     let run_fut = run_seat(&client, req, inbox, tx, None);
     tokio::pin!(run_fut);
     let mut result = None;
-    let mut saw_tool = false;
+    let mut escape_events = 0usize;
+    let mut cancel_before_result = 0usize;
     loop {
         tokio::select! {
             outcome = &mut run_fut, if result.is_none() => {
@@ -392,11 +399,14 @@ async fn protected_root_midrun_escape_after_tool_call() {
             }
             event = rx.recv() => match event {
                 Some(event) => {
-                    if matches!(&event.kind, SeatEventKind::ToolCall { .. }) {
-                        saw_tool = true;
+                    if matches!(&event.kind, SeatEventKind::RunStarted { .. }) {
                         fs::write(&tracked_mut, b"after").unwrap();
                     }
+                    if matches!(&event.kind, SeatEventKind::Fence { kind, .. } if kind == "escape") {
+                        escape_events += 1;
+                    }
                     if let SeatEventKind::Result(r) = event.kind {
+                        cancel_before_result = bridge.call_count("SdkAgentService/CancelRun");
                         result = Some(r);
                     }
                 }
@@ -408,10 +418,268 @@ async fn protected_root_midrun_escape_after_tool_call() {
         }
     }
     let result = result.expect("result");
-    assert!(saw_tool);
+    assert_eq!(escape_events, 1);
+    assert_eq!(cancel_before_result, 1);
     assert_eq!(result.outcome, Outcome::Bounced);
     assert_eq!(result.error_kind.as_deref(), Some("FenceEscape"));
+    tokio::time::sleep(Duration::from_millis(1500)).await;
     assert_eq!(bridge.call_count("SdkAgentService/CancelRun"), 1);
+}
+
+#[tokio::test]
+async fn shell_nested_working_directory_into_root_bounces() {
+    let cwd = workspace_dir();
+    let protected = workspace_dir();
+    fs::create_dir_all(&protected).unwrap();
+    let bridge = FakeBridge::start().await;
+    script_models_create_close(&bridge);
+    bridge.expect(
+        "SdkAgentService/Send",
+        Reply::Stream(vec![
+            sdk_message_frame(
+                "system",
+                json!({"run_id": "run_1", "agent_id": "agent_1"}),
+                Some("o1"),
+            ),
+            sdk_message_frame(
+                "tool_call",
+                json!({
+                    "name": "shell",
+                    "args": {
+                        "command": "true",
+                        "arguments": {"working_directory": protected.display().to_string()},
+                    },
+                    "status": "started",
+                    "call_id": "c1",
+                }),
+                Some("o2"),
+            ),
+            result_frame(
+                "agent_1",
+                "run_1",
+                proto::RunLifecycleStatus::Cancelled,
+                "",
+            ),
+            done_frame("agent_1", "run_1"),
+        ]),
+    );
+    bridge.always(
+        "SdkAgentService/CancelRun",
+        Reply::unary(&proto::CancelRunResponse {}),
+    );
+    let req = fenced_request(
+        cwd,
+        vec!["src".into()],
+        vec![protected.to_string_lossy().into_owned()],
+    );
+    let (events, result) = collect(&bridge, req).await;
+    let escapes = events
+        .iter()
+        .filter(|e| matches!(&e.kind, SeatEventKind::Fence { kind, .. } if kind == "escape"))
+        .count();
+    assert_eq!(escapes, 1);
+    assert_eq!(bridge.call_count("SdkAgentService/CancelRun"), 1);
+    assert_eq!(result.error_kind.as_deref(), Some("FenceEscape"));
+}
+
+#[tokio::test]
+async fn shell_relative_command_into_protected_root_bounces() {
+    let parent = workspace_dir();
+    let protected = parent.join("main");
+    let cwd = parent.join("wt");
+    fs::create_dir_all(&protected).unwrap();
+    fs::create_dir_all(&cwd).unwrap();
+    let bridge = FakeBridge::start().await;
+    script_models_create_close(&bridge);
+    bridge.expect(
+        "SdkAgentService/Send",
+        Reply::Stream(vec![
+            sdk_message_frame(
+                "system",
+                json!({"run_id": "run_1", "agent_id": "agent_1"}),
+                Some("o1"),
+            ),
+            sdk_message_frame(
+                "tool_call",
+                json!({
+                    "name": "shell",
+                    "args": {"command": "cd ../main && cargo test"},
+                    "status": "started",
+                    "call_id": "c1",
+                }),
+                Some("o2"),
+            ),
+            result_frame(
+                "agent_1",
+                "run_1",
+                proto::RunLifecycleStatus::Cancelled,
+                "",
+            ),
+            done_frame("agent_1", "run_1"),
+        ]),
+    );
+    bridge.always(
+        "SdkAgentService/CancelRun",
+        Reply::unary(&proto::CancelRunResponse {}),
+    );
+    let req = fenced_request(
+        cwd,
+        vec!["src".into()],
+        vec![protected.to_string_lossy().into_owned()],
+    );
+    let (_, result) = collect(&bridge, req).await;
+    assert_eq!(result.error_kind.as_deref(), Some("FenceEscape"));
+}
+
+#[tokio::test]
+async fn shell_quoted_space_root_name_bounces() {
+    let cwd = workspace_dir();
+    let protected = workspace_dir().join("my root");
+    fs::create_dir_all(&protected).unwrap();
+    let bridge = FakeBridge::start().await;
+    script_models_create_close(&bridge);
+    let cmd = format!("cat \"{}/secret.txt\"", protected.display());
+    bridge.expect(
+        "SdkAgentService/Send",
+        Reply::Stream(vec![
+            sdk_message_frame(
+                "system",
+                json!({"run_id": "run_1", "agent_id": "agent_1"}),
+                Some("o1"),
+            ),
+            sdk_message_frame(
+                "tool_call",
+                json!({
+                    "name": "shell",
+                    "args": {"command": cmd},
+                    "status": "started",
+                    "call_id": "c1",
+                }),
+                Some("o2"),
+            ),
+            result_frame(
+                "agent_1",
+                "run_1",
+                proto::RunLifecycleStatus::Cancelled,
+                "",
+            ),
+            done_frame("agent_1", "run_1"),
+        ]),
+    );
+    bridge.always(
+        "SdkAgentService/CancelRun",
+        Reply::unary(&proto::CancelRunResponse {}),
+    );
+    let req = fenced_request(
+        cwd,
+        vec!["src".into()],
+        vec![protected.to_string_lossy().into_owned()],
+    );
+    let (_, result) = collect(&bridge, req).await;
+    assert_eq!(result.error_kind.as_deref(), Some("FenceEscape"));
+}
+
+#[tokio::test]
+async fn shell_path_colon_field_into_root_bounces() {
+    let cwd = workspace_dir();
+    let protected = workspace_dir();
+    fs::create_dir_all(protected.join("bin")).unwrap();
+    let bridge = FakeBridge::start().await;
+    script_models_create_close(&bridge);
+    let cmd = format!("PATH=$PATH:{}", protected.join("bin").display());
+    bridge.expect(
+        "SdkAgentService/Send",
+        Reply::Stream(vec![
+            sdk_message_frame(
+                "system",
+                json!({"run_id": "run_1", "agent_id": "agent_1"}),
+                Some("o1"),
+            ),
+            sdk_message_frame(
+                "tool_call",
+                json!({
+                    "name": "shell",
+                    "args": {"command": cmd},
+                    "status": "started",
+                    "call_id": "c1",
+                }),
+                Some("o2"),
+            ),
+            result_frame(
+                "agent_1",
+                "run_1",
+                proto::RunLifecycleStatus::Cancelled,
+                "",
+            ),
+            done_frame("agent_1", "run_1"),
+        ]),
+    );
+    bridge.always(
+        "SdkAgentService/CancelRun",
+        Reply::unary(&proto::CancelRunResponse {}),
+    );
+    let req = fenced_request(
+        cwd,
+        vec!["src".into()],
+        vec![protected.to_string_lossy().into_owned()],
+    );
+    let (_, result) = collect(&bridge, req).await;
+    assert_eq!(result.error_kind.as_deref(), Some("FenceEscape"));
+}
+
+#[tokio::test]
+async fn fence_escape_latch_single_cancel_and_event() {
+    let cwd = workspace_dir();
+    let protected = workspace_dir();
+    fs::create_dir_all(&protected).unwrap();
+    let bridge = FakeBridge::start().await;
+    script_models_create_close(&bridge);
+    let mut stream_frames = vec![
+        sdk_message_frame(
+            "system",
+            json!({"run_id": "run_1", "agent_id": "agent_1"}),
+            Some("o1"),
+        ),
+        sdk_message_frame(
+            "tool_call",
+            json!({
+                "name": "shell",
+                "args": {"command": format!("cd {} && true", protected.display())},
+                "status": "started",
+                "call_id": "c1",
+            }),
+            Some("o2"),
+        ),
+    ];
+    stream_frames.extend((0..96).map(|_| keepalive_frame()));
+    stream_frames.push(
+        result_frame(
+            "agent_1",
+            "run_1",
+            proto::RunLifecycleStatus::Cancelled,
+            "",
+        ),
+    );
+    stream_frames.push(done_frame("agent_1", "run_1"));
+    bridge.expect("SdkAgentService/Send", Reply::Stream(stream_frames));
+    bridge.always(
+        "SdkAgentService/CancelRun",
+        Reply::unary(&proto::CancelRunResponse {}),
+    );
+    let mut req = fenced_request(
+        cwd,
+        vec!["src".into()],
+        vec![protected.to_string_lossy().into_owned()],
+    );
+    req.limits.heartbeat_s = 1;
+    let (events, result) = collect(&bridge, req).await;
+    let escapes = events
+        .iter()
+        .filter(|e| matches!(&e.kind, SeatEventKind::Fence { kind, .. } if kind == "escape"))
+        .count();
+    assert_eq!(escapes, 1);
+    assert_eq!(bridge.call_count("SdkAgentService/CancelRun"), 1);
+    assert_eq!(result.error_kind.as_deref(), Some("FenceEscape"));
 }
 
 #[tokio::test]

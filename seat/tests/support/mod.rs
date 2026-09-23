@@ -7,14 +7,18 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
+use std::time::Duration;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use cursor_sdk::proto;
-use http_body_util::{BodyExt, Full};
+use futures_util::StreamExt as _;
+use http_body_util::{BodyExt, Full, StreamBody, combinators::BoxBody};
+use hyper::body::Frame;
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
@@ -37,6 +41,8 @@ pub enum Reply {
     },
     /// A server stream: pre-framed payloads, then an end-of-stream frame.
     Stream(Vec<Bytes>),
+    /// Stream frames delivered over HTTP with a delay before each chunk.
+    StreamTimed(Vec<(Duration, Bytes)>),
 }
 
 impl Reply {
@@ -207,7 +213,9 @@ type State = (
     String,
 );
 
-async fn handle(state: State, request: Request<Incoming>) -> Response<Full<Bytes>> {
+type BoxResponse = Response<BoxBody<Bytes, Infallible>>;
+
+async fn handle(state: State, request: Request<Incoming>) -> BoxResponse {
     let (replies, recorded, token) = state;
     let path = request
         .uri()
@@ -252,11 +260,13 @@ async fn handle(state: State, request: Request<Incoming>) -> Response<Full<Bytes
     };
 
     match reply {
-        Some(Reply::Unary(payload)) => Response::builder()
-            .status(StatusCode::OK)
-            .header(hyper::header::CONTENT_TYPE, "application/proto")
-            .body(Full::new(payload))
-            .unwrap(),
+        Some(Reply::Unary(payload)) => {
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(hyper::header::CONTENT_TYPE, "application/proto")
+                .body(Full::new(payload).map_err(|never| match never {}).boxed())
+                .unwrap()
+        }
         Some(Reply::Error {
             status,
             code,
@@ -272,7 +282,30 @@ async fn handle(state: State, request: Request<Incoming>) -> Response<Full<Bytes
             Response::builder()
                 .status(StatusCode::OK)
                 .header(hyper::header::CONTENT_TYPE, "application/connect+proto")
-                .body(Full::new(Bytes::from(body)))
+                .body(Full::new(Bytes::from(body)).map_err(|never| match never {}).boxed())
+                .unwrap()
+        }
+        Some(Reply::StreamTimed(steps)) => {
+            let (tx, rx) = tokio::sync::mpsc::channel(8);
+            tokio::spawn(async move {
+                for (delay, frame) in steps {
+                    if !delay.is_zero() {
+                        tokio::time::sleep(delay).await;
+                    }
+                    if tx.send(frame).await.is_err() {
+                        return;
+                    }
+                }
+                let _ = tx.send(end_of_stream(None)).await;
+            });
+            let body = StreamBody::new(
+                tokio_stream::wrappers::ReceiverStream::new(rx)
+                    .map(|chunk| Ok::<Frame<Bytes>, Infallible>(Frame::data(chunk))),
+            );
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(hyper::header::CONTENT_TYPE, "application/connect+proto")
+                .body(BodyExt::boxed(body))
                 .unwrap()
         }
         None => connect_error(
@@ -289,7 +322,7 @@ fn connect_error(
     code: &str,
     message: &str,
     details: Option<proto::SdkErrorDetails>,
-) -> Response<Full<Bytes>> {
+) -> BoxResponse {
     use base64::Engine as _;
     let mut body = serde_json::json!({"code": code, "message": message});
     if let Some(details) = details {
@@ -302,7 +335,11 @@ fn connect_error(
     Response::builder()
         .status(status)
         .header(hyper::header::CONTENT_TYPE, "application/json")
-        .body(Full::new(Bytes::from(body.to_string())))
+        .body(
+            Full::new(Bytes::from(body.to_string()))
+                .map_err(|never| match never {})
+                .boxed(),
+        )
         .unwrap()
 }
 

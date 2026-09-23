@@ -190,28 +190,57 @@ fn all_path_from_args(args: &serde_json::Map<String, Value>) -> Vec<String> {
     paths
 }
 
+fn collect_shell_cwd_values(args: &serde_json::Map<String, Value>, out: &mut Vec<String>) {
+    const CWD_KEYS: &[&str] = &["cwd", "working_directory", "workingDirectory"];
+    for key in CWD_KEYS {
+        if let Some(value) = args.get(*key).and_then(Value::as_str) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                out.push(trimmed.to_string());
+            }
+        }
+    }
+    if let Some(Value::Object(nested)) = args.get("arguments") {
+        for key in CWD_KEYS {
+            if let Some(value) = nested.get(*key).and_then(Value::as_str) {
+                let trimmed = value.trim();
+                if !trimmed.is_empty() {
+                    out.push(trimmed.to_string());
+                }
+            }
+        }
+    }
+}
+
+fn shell_effective_cwd(args: &serde_json::Map<String, Value>, worktree_cwd: &Path) -> PathBuf {
+    let mut values = Vec::new();
+    collect_shell_cwd_values(args, &mut values);
+    if let Some(raw) = values.into_iter().next() {
+        return resolve_fence_path(&raw, worktree_cwd);
+    }
+    resolved_clean(worktree_cwd)
+}
+
 fn shell_escape(
     args: &serde_json::Map<String, Value>,
     cwd: &Path,
     allowed_extra: &[PathBuf],
     protected_roots: &[PathBuf],
 ) -> Option<PathBuf> {
-    const CWD_KEYS: &[&str] = &["cwd", "working_directory", "workingDirectory"];
-    for key in CWD_KEYS {
-        if let Some(value) = args.get(*key).and_then(Value::as_str) {
-            let trimmed = value.trim();
-            if !trimmed.is_empty() {
-                if let Some(hit) = resolve_escape(trimmed, cwd, allowed_extra) {
-                    return Some(hit);
-                }
-            }
+    let mut cwd_values = Vec::new();
+    collect_shell_cwd_values(args, &mut cwd_values);
+    for raw in &cwd_values {
+        if let Some(hit) = resolve_escape(raw, cwd, allowed_extra) {
+            return Some(hit);
         }
     }
     if protected_roots.is_empty() {
         return None;
     }
+    let effective = shell_effective_cwd(args, cwd);
     for cmd in shell_command_strings(args) {
-        if let Some(hit) = shell_command_protected_escape(&cmd, cwd, allowed_extra, protected_roots)
+        if let Some(hit) =
+            shell_command_protected_escape(&cmd, &effective, cwd, allowed_extra, protected_roots)
         {
             return Some(hit);
         }
@@ -244,29 +273,99 @@ fn shell_command_strings(args: &serde_json::Map<String, Value>) -> Vec<String> {
     out
 }
 
-fn is_shell_metachar(ch: char) -> bool {
+fn is_unquoted_shell_break(ch: char) -> bool {
     ch.is_whitespace()
-        || matches!(ch, ';' | '|' | '&' | '<' | '>' | '(' | ')' | '\'' | '"' | '\\' | '\n' | '`')
+        || matches!(ch, ';' | '|' | '&' | '<' | '>' | '(' | ')' | '\n' | '`')
 }
 
-/// Split a shell command on whitespace and shell metacharacters (quotes delimit only).
+/// Split a shell command on whitespace and shell metacharacters; honour quotes and `\`.
 pub fn tokenize_shell_command(cmd: &str) -> Vec<String> {
     let mut tokens = Vec::new();
-    let mut current = String::new();
-    for ch in cmd.chars() {
-        if is_shell_metachar(ch) {
-            if !current.is_empty() {
-                tokens.push(current.clone());
-                current.clear();
-            }
-        } else {
-            current.push(ch);
-        }
-    }
-    if !current.is_empty() {
-        tokens.push(current);
-    }
+    tokenize_shell_command_into(cmd, &mut tokens);
     tokens
+}
+
+fn tokenize_shell_command_into(cmd: &str, out: &mut Vec<String>) {
+    let chars: Vec<char> = cmd.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if is_unquoted_shell_break(chars[i]) {
+            i += 1;
+            continue;
+        }
+        if chars[i] == '\'' {
+            let (content, next) = read_single_quoted(&chars, i + 1);
+            push_quoted_shell_token(&content, out);
+            i = next;
+            continue;
+        }
+        if chars[i] == '"' {
+            let (content, next) = read_double_quoted(&chars, i + 1);
+            push_quoted_shell_token(&content, out);
+            i = next;
+            continue;
+        }
+        let (word, next) = read_unquoted_word(&chars, i);
+        if !word.is_empty() {
+            out.push(word);
+        }
+        i = next;
+    }
+}
+
+fn push_quoted_shell_token(content: &str, out: &mut Vec<String>) {
+    if content.is_empty() {
+        return;
+    }
+    out.push(content.to_string());
+    tokenize_shell_command_into(content, out);
+}
+
+fn read_single_quoted(chars: &[char], start: usize) -> (String, usize) {
+    let mut content = String::new();
+    let mut i = start;
+    while i < chars.len() && chars[i] != '\'' {
+        content.push(chars[i]);
+        i += 1;
+    }
+    let end = if i < chars.len() { i + 1 } else { i };
+    (content, end)
+}
+
+fn read_double_quoted(chars: &[char], start: usize) -> (String, usize) {
+    let mut content = String::new();
+    let mut i = start;
+    while i < chars.len() {
+        if chars[i] == '\\' && i + 1 < chars.len() {
+            content.push(chars[i + 1]);
+            i += 2;
+            continue;
+        }
+        if chars[i] == '"' {
+            return (content, i + 1);
+        }
+        content.push(chars[i]);
+        i += 1;
+    }
+    (content, i)
+}
+
+fn read_unquoted_word(chars: &[char], start: usize) -> (String, usize) {
+    let mut word = String::new();
+    let mut i = start;
+    while i < chars.len() {
+        if chars[i] == '\\' && i + 1 < chars.len() {
+            word.push(chars[i + 1]);
+            i += 2;
+            continue;
+        }
+        if is_unquoted_shell_break(chars[i]) || chars[i] == '\'' || chars[i] == '"' {
+            break;
+        }
+        word.push(chars[i]);
+        i += 1;
+    }
+    (word, i)
 }
 
 fn path_candidates_from_token(token: &str) -> Vec<String> {
@@ -274,23 +373,37 @@ fn path_candidates_from_token(token: &str) -> Vec<String> {
     if trimmed.is_empty() {
         return Vec::new();
     }
-    let unquoted = trimmed.trim_matches(|c| c == '\'' || c == '"');
-    let mut out = vec![unquoted.to_string()];
-    if let Some((_, value)) = unquoted.split_once('=') {
-        let v = value.trim_matches(|c| c == '\'' || c == '"');
+    let mut out = vec![trimmed.to_string()];
+    if let Some((_, value)) = trimmed.split_once('=') {
+        let v = value.trim();
         if !v.is_empty() {
             out.push(v.to_string());
+            for field in v.split(':') {
+                let f = field.trim();
+                if !f.is_empty() {
+                    out.push(f.to_string());
+                }
+            }
         }
     }
+    out.sort();
+    out.dedup();
     out
 }
 
 fn is_absolute_or_home_spelling(token: &str) -> bool {
-    let t = token.trim().trim_matches(|c| c == '\'' || c == '"');
+    let t = token.trim();
     t.starts_with('/')
         || t.starts_with('~')
         || t.starts_with("$HOME")
         || t.starts_with("${HOME}")
+}
+
+fn is_relative_path_spelling(token: &str) -> bool {
+    let t = token.trim();
+    !t.is_empty()
+        && !is_absolute_or_home_spelling(t)
+        && (t.starts_with('.') || t.contains('/') || t.contains('\\'))
 }
 
 /// Lexical path for an absolute or home-relative shell token (no symlink follow).
@@ -354,19 +467,30 @@ fn hits_protected_root(
     None
 }
 
+fn lexical_relative_shell_path(token: &str, base: &Path) -> PathBuf {
+    lexically_normalize(&join_base(token.trim(), base))
+}
+
 fn shell_command_protected_escape(
     cmd: &str,
-    cwd: &Path,
+    effective_cwd: &Path,
+    worktree_cwd: &Path,
     allowed_extra: &[PathBuf],
     protected_roots: &[PathBuf],
 ) -> Option<PathBuf> {
     for token in tokenize_shell_command(cmd) {
         for candidate in path_candidates_from_token(&token) {
-            if !is_absolute_or_home_spelling(&candidate) {
+            let paths: Vec<PathBuf> = if is_absolute_or_home_spelling(&candidate) {
+                lexical_shell_path(&candidate).into_iter().collect()
+            } else if is_relative_path_spelling(&candidate) {
+                vec![lexical_relative_shell_path(&candidate, effective_cwd)]
+            } else {
                 continue;
-            }
-            if let Some(path) = lexical_shell_path(&candidate) {
-                if let Some(hit) = hits_protected_root(&path, protected_roots, cwd, allowed_extra) {
+            };
+            for path in paths {
+                if let Some(hit) =
+                    hits_protected_root(&path, protected_roots, worktree_cwd, allowed_extra)
+                {
                     return Some(hit);
                 }
             }
@@ -1247,5 +1371,61 @@ mod tests {
         fs::write(wt.join("ok.txt"), b"ok").unwrap();
         let cmd = format!("cat {}/ok.txt", wt.display());
         assert!(shell_hit(&cmd, &wt, &[main]).is_none());
+    }
+
+    #[test]
+    fn shell_command_relative_dotdot_into_protected_root() {
+        let parent = unique_temp("shell-rel-parent");
+        let main = parent.join("main");
+        let wt = parent.join("wt");
+        fs::create_dir_all(main.join("target")).unwrap();
+        fs::create_dir_all(&wt).unwrap();
+        assert!(shell_hit("CARGO_TARGET_DIR=../main/target cargo test", &wt, &[main.clone()]).is_some());
+        assert!(shell_hit("cd ../main && git status", &wt, &[main.clone()]).is_some());
+        assert!(shell_hit("cat ../main/x", &wt, &[main]).is_some());
+    }
+
+    #[test]
+    fn shell_command_ln_relative_into_root() {
+        let parent = unique_temp("shell-ln-parent");
+        let main = parent.join("main");
+        let wt = parent.join("wt");
+        fs::create_dir_all(&main).unwrap();
+        fs::create_dir_all(&wt).unwrap();
+        assert!(shell_hit("ln -sfn ../main/sdk sdk", &wt, &[main.clone()]).is_some());
+        assert!(shell_hit("cat sdk/secret.txt", &wt, &[main]).is_none());
+    }
+
+    #[test]
+    fn shell_command_path_colon_field_hits_root() {
+        let cwd = unique_temp("shell-path-colon-cwd");
+        let main = unique_temp("shell-path-colon-main");
+        fs::create_dir_all(main.join("bin")).unwrap();
+        let cmd = format!("PATH=$PATH:{}", main.join("bin").display());
+        assert!(shell_hit(&cmd, &cwd, &[main]).is_some());
+    }
+
+    #[test]
+    fn shell_nested_arguments_working_directory_escape() {
+        let cwd = unique_temp("shell-nested-cwd");
+        let main = unique_temp("shell-nested-main");
+        fs::create_dir_all(&main).unwrap();
+        let args = serde_json::json!({
+            "command": "true",
+            "arguments": {"working_directory": main.display().to_string()},
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        assert!(tool_escape("shell", &args, &cwd, &[], &[]).is_some());
+    }
+
+    #[test]
+    fn shell_quoted_path_with_space_in_root_name() {
+        let cwd = unique_temp("shell-space-cwd");
+        let main = unique_temp("shell space root");
+        fs::create_dir_all(&main).unwrap();
+        let cmd = format!("cat \"{}/x.txt\"", main.display());
+        assert!(shell_hit(&cmd, &cwd, &[main]).is_some());
     }
 }

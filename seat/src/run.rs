@@ -349,7 +349,7 @@ pub async fn run_seat(
     let protected_before = if protected_roots.is_empty() {
         None
     } else {
-        Some(snapshot_async(&protected_roots, &request.fence, &cwd).await)
+        snapshot_async(&protected_roots, &request.fence, &cwd).await
     };
 
     // Phase D: open the stream on the same agent across retries.
@@ -879,7 +879,7 @@ async fn attach(
             let protected_before = if protected_roots.is_empty() {
                 None
             } else {
-                Some(snapshot_async(&protected_roots, &request.fence, &cwd).await)
+                snapshot_async(&protected_roots, &request.fence, &cwd).await
             };
             let (result, flags) = drive(
                 request,
@@ -992,11 +992,14 @@ async fn drive(
     let heartbeat = Duration::from_secs(request.limits.heartbeat_s);
     let deadline = wall_start + Duration::from_secs(request.limits.timeout_s);
     let mut interval = tokio::time::interval(heartbeat.max(Duration::from_secs(1)));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last_activity = Instant::now();
     let mut controls_open = true;
 
     let mut state = DriveState::default();
     state.start = Some(wall_start);
+    // Baseline snapshot was just taken; debounce mid-run samples (incl. interval's first tick).
+    state.last_protected_snapshot = Some(Instant::now());
     if let Some((run_id, agent_id)) = attached {
         // Resumed attach: the run is live remotely (ObserveRun
         // succeeded), so announce it up front. Controls queued before the
@@ -1020,6 +1023,11 @@ async fn drive(
                 match event {
                     Some(Ok(RunEvent::Message(message))) => {
                         observe_ids(handles, message.run_id(), &mut state, session, emit).await;
+                        if message.kind.as_str() == "tool_call"
+                            && tool_call_is_replay(&message, &mut state)
+                        {
+                            continue;
+                        }
                         if fence.guard_tools {
                             if let Some(path) = tool_fence_hit(
                                 &message,
@@ -1041,22 +1049,14 @@ async fn drive(
                                 let is_tool_call = message.kind.as_str() == "tool_call";
                                 emit_message(message, &mut state, emit);
                                 if is_tool_call {
-                                    let now = Instant::now();
-                                    let due = state
-                                        .last_protected_snapshot
-                                        .map(|t| now.duration_since(t) >= Duration::from_secs(1))
-                                        .unwrap_or(true);
-                                    if due {
-                                        state.last_protected_snapshot = Some(now);
-                                        protected_snapshot_escape(
-                                            &fence,
-                                            &mut state,
-                                            handles,
-                                            session,
-                                            emit,
-                                        )
-                                        .await;
-                                    }
+                                    maybe_protected_snapshot_escape(
+                                        &fence,
+                                        &mut state,
+                                        handles,
+                                        session,
+                                        emit,
+                                    )
+                                    .await;
                                 }
                             }
                         } else {
@@ -1113,7 +1113,14 @@ async fn drive(
                     last_activity = Instant::now();
                 }
                 if fence.guard_tools {
-                    protected_snapshot_escape(&fence, &mut state, handles, session, emit).await;
+                    maybe_protected_snapshot_escape(
+                        &fence,
+                        &mut state,
+                        handles,
+                        session,
+                        emit,
+                    )
+                    .await;
                 }
             }
             _ = tokio::time::sleep_until(deadline.into()) => {
@@ -1236,13 +1243,14 @@ async fn apply_control(
     }
 }
 
-async fn snapshot_async(protected_roots: &[PathBuf], fence: &[String], cwd: &Path) -> Digest {
+async fn snapshot_async(protected_roots: &[PathBuf], fence: &[String], cwd: &Path) -> Option<Digest> {
     let roots = protected_roots.to_vec();
     let fence = fence.to_vec();
     let cwd = cwd.to_path_buf();
-    tokio::task::spawn_blocking(move || snapshot(&roots, &fence, &cwd))
-        .await
-        .unwrap_or_default()
+    match tokio::task::spawn_blocking(move || snapshot(&roots, &fence, &cwd)).await {
+        Ok(digest) => Some(digest),
+        Err(_) => None,
+    }
 }
 
 fn emit_fence_drift(paths: &[String], emit: &mut dyn FnMut(SeatEventKind)) {
@@ -1277,7 +1285,9 @@ async fn apply_post_drive_fence(
     emit: &mut dyn FnMut(SeatEventKind),
 ) -> (SeatResult, DriveFlags) {
     if let Some(before) = protected_before {
-        let after = snapshot_async(protected_roots, &request.fence, cwd).await;
+        let Some(after) = snapshot_async(protected_roots, &request.fence, cwd).await else {
+            return (result, flags);
+        };
         let paths = changed(before, &after);
         if !paths.is_empty() {
             result = fence_escape_result(
@@ -1384,6 +1394,16 @@ fn tool_fence_hit(
     crate::fence::tool_escape(&name, &args, cwd, allowed_extra, protected_roots)
 }
 
+fn tool_call_is_replay(message: &StreamMessage, state: &mut DriveState) -> bool {
+    let call_id = str_field(message, "call_id")
+        .or_else(|| str_field(message, "callId"))
+        .unwrap_or_default();
+    if call_id.is_empty() {
+        return false;
+    }
+    !state.seen_tool_calls.insert(call_id.to_string())
+}
+
 async fn emit_fence_escape(
     path: &Path,
     tool: &str,
@@ -1392,6 +1412,9 @@ async fn emit_fence_escape(
     session: &mut Option<SessionStore>,
     emit: &mut dyn FnMut(SeatEventKind),
 ) {
+    if state.fence_escape.is_some() {
+        return;
+    }
     emit(SeatEventKind::Fence {
         kind: "escape".to_string(),
         path: path.display().to_string(),
@@ -1407,21 +1430,32 @@ async fn emit_fence_escape(
     }
 }
 
-async fn protected_snapshot_escape(
+async fn maybe_protected_snapshot_escape(
     fence: &DriveFence,
     state: &mut DriveState,
     handles: &Handles<'_>,
     session: &mut Option<SessionStore>,
     emit: &mut dyn FnMut(SeatEventKind),
 ) {
-    if fence.protected_roots.is_empty() {
+    if state.fence_escape.is_some() || fence.protected_roots.is_empty() {
         return;
     }
     let Some(before) = fence.protected_baseline.as_ref() else {
         return;
     };
-    let after =
-        snapshot_async(&fence.protected_roots, &fence.fence_entries, &fence.cwd).await;
+    let now = Instant::now();
+    let due = state
+        .last_protected_snapshot
+        .is_some_and(|t| now.duration_since(t) >= Duration::from_secs(1));
+    if !due {
+        return;
+    }
+    state.last_protected_snapshot = Some(now);
+    let Some(after) =
+        snapshot_async(&fence.protected_roots, &fence.fence_entries, &fence.cwd).await
+    else {
+        return;
+    };
     let paths = changed(before, &after);
     if paths.is_empty() {
         return;
@@ -1543,10 +1577,6 @@ fn emit_message(
                 .or_else(|| str_field(&message, "callId"))
                 .unwrap_or_default()
                 .to_string();
-            // call_ids are unique per call: a repeated id is a replay.
-            if !call_id.is_empty() && !state.seen_tool_calls.insert(call_id.clone()) {
-                return;
-            }
             emit(SeatEventKind::ToolCall {
                 label,
                 status,

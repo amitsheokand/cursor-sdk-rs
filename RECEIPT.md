@@ -1,40 +1,51 @@
 # RECEIPT — T-seat-shell-guard
 
-## What changed
+## What changed (565b3d4 + review round 1)
 
 | File | Summary |
 |------|---------|
-| `seat/src/fence.rs` | Shell command token scan against `protected_roots`; `tool_escape` takes protected roots |
-| `seat/src/run.rs` | `DriveFence` carries baseline snapshot; live + heartbeat mid-run re-check |
-| `seat/PROTOCOL.md` | Document shell command scan and mid-run protected-root re-check |
-| `seat/tests/fence_run.rs` | Integration tests for shell command escape and mid-run snapshot escape |
+| `seat/src/fence.rs` | Shell scan: quotes, relative paths, PATH `:`, nested cwd |
+| `seat/src/run.rs` | Escape latch, tool_call dedup, shared snapshot debounce |
+| `seat/PROTOCOL.md` | Shell command scan + mid-run re-check (unchanged this round) |
+| `seat/tests/fence_run.rs` | Mid-run, latch, nested cwd, relative, PATH, quoted root |
+| `seat/tests/support/mod.rs` | `StreamTimed` for delayed stream frames in tests |
+| `seat/Cargo.toml` | `futures-util`, `tokio-stream` dev-deps for timed streams |
 
-## New tests
+## Review round 1
 
-### `fence::tests` (unit)
+| Finding | Fix | Test |
+|---------|-----|------|
+| Escape latch / duplicate cancel+event | `emit_fence_escape` no-ops when `fence_escape` set; `MissedTickBehavior::Skip` | `fence_escape_latch_single_cancel_and_event` |
+| Replay re-triggers fence | `tool_call_is_replay` before fence check | (resume dedup path; latch test) |
+| Snapshot cadence | `maybe_protected_snapshot_escape` + shared `last_protected_snapshot` ≥1s; skip when latched; seed clock at drive start | `protected_root_midrun_escape_after_tool_call` |
+| Relative shell tokens | Join to effective shell cwd, lexical normalize, `hits_protected_root` | `shell_command_relative_dotdot_into_protected_root`, `shell_relative_command_into_protected_root_bounces` |
+| Nested shell cwd keys | `collect_shell_cwd_values` reads `arguments` | `shell_nested_arguments_working_directory_escape`, `shell_nested_working_directory_into_root_bounces` |
+| Tokenizer / PATH colon | Quoted spans, `\` escape, inner re-tokenize, `=` value split on `:` | `shell_command_path_colon_field_hits_root`, `shell_path_colon_field_into_root_bounces`, `shell_quoted_path_with_space_in_root_name` |
+| JoinError → empty digest | `snapshot_async` returns `None` on join failure | (mid-run skips sample; no false escape) |
+| Mid-run test race | Write on `RunStarted` before delayed `tool_call`; `StreamTimed` | `protected_root_midrun_escape_after_tool_call` |
 
-- `shell_command_cp_into_protected_root`
-- `shell_command_cd_into_protected_root`
-- `shell_command_git_checkout_in_protected_root`
-- `shell_command_cargo_target_dir_env`
-- `shell_command_manifest_path_flag`
-- `shell_command_home_spelling_variants`
-- `shell_command_quoted_absolute_path`
-- `shell_command_bash_lc_nested`
-- `shell_command_allows_tmp_and_nix`
-- `shell_command_prefix_not_string_substring`
-- `shell_command_ignores_relative_symlink_into_root`
-- `shell_command_path_under_cwd_sibling_of_root`
+## New tests (round 1)
 
-### `fence_run` (integration)
+### Unit (`fence::tests`)
 
-- `shell_command_into_protected_root_bounces_and_cancels`
-- `protected_root_midrun_escape_after_tool_call`
+- `shell_command_relative_dotdot_into_protected_root`
+- `shell_command_ln_relative_into_root`
+- `shell_command_path_colon_field_hits_root`
+- `shell_nested_arguments_working_directory_escape`
+- `shell_quoted_path_with_space_in_root_name`
+
+### Integration (`fence_run`)
+
+- `shell_nested_working_directory_into_root_bounces`
+- `shell_relative_command_into_protected_root_bounces`
+- `shell_quoted_space_root_name_bounces`
+- `shell_path_colon_field_into_root_bounces`
+- `fence_escape_latch_single_cancel_and_event`
 
 ## Gate (second run tail)
 
 ```
-     Running tests/session_run.rs (target/debug/deps/session_run-b12077195ce0ebac)
+     Running tests/session_run.rs (target/debug/deps/session_run-97c18104d41e045e)
 
 running 3 tests
 test live_run_attaches_instead_of_resending ... ok
