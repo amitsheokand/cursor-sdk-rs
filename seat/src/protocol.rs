@@ -372,7 +372,11 @@ mod tests {
 
     #[test]
     fn request_validation_enforces_task_law() {
-        let dir = std::env::temp_dir().join("cursor-seat-validate-task");
+        let dir = std::env::temp_dir().join(format!(
+            "cursor-seat-validate-task-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::create_dir_all(&dir);
         let mut req = minimal_request();
         req.cwd = dir.to_string_lossy().into_owned();

@@ -407,7 +407,11 @@ static WORKSPACE_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// Fresh absolute directory for a seat `cwd` (must exist for validation).
 pub fn workspace_dir() -> PathBuf {
     let n = WORKSPACE_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("cursor-seat-ws-{n}"));
+    let dir = std::env::temp_dir().join(format!(
+        "cursor-seat-ws-{}-{n}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("workspace dir");
     dir
 }

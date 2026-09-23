@@ -1,8 +1,9 @@
 //! Worktree fence: escape detection, protected-root snapshots, git drift.
 
 use std::collections::BTreeMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::path::{Component, Path, PathBuf};
-use std::time::SystemTime;
 
 use cursor_sdk::StreamMessage;
 use serde_json::Value;
@@ -11,22 +12,79 @@ use serde_json::Value;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileMeta {
     pub size: u64,
-    pub modified: SystemTime,
+    pub content_hash: u64,
 }
 
 /// Path → metadata digest for fence entries under a protected root.
 pub type Digest = BTreeMap<PathBuf, FileMeta>;
 
 /// Whether `rel_path` (worktree-relative, normalized) lies inside the fence.
-pub fn in_fence(rel_path: &str, fence: &[String]) -> bool {
+pub fn in_fence(rel_path: &str, cwd: &Path, fence: &[String]) -> bool {
     if fence.is_empty() {
+        return true;
+    }
+    let entries = worktree_fence_entries(cwd, fence);
+    if entries.is_empty() {
         return true;
     }
     let rel = normalize_rel(rel_path);
     if rel.is_empty() {
         return false;
     }
-    fence.iter().any(|entry| entry_matches(&rel, entry))
+    entries.iter().any(|entry| entry_matches(&rel, entry))
+}
+
+/// Fence entries that apply inside `cwd` (worktree-relative, normalized).
+pub fn worktree_fence_entries(cwd: &Path, fence: &[String]) -> Vec<String> {
+    let cwd_canon = resolved_clean(cwd);
+    let mut out = Vec::new();
+    for raw in fence {
+        if let Some(rel) = entry_relative_to_cwd(raw, &cwd_canon) {
+            out.push(rel);
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn fence_path_token(raw: &str) -> &str {
+    raw.trim().split_whitespace().next().unwrap_or("")
+}
+
+fn expand_tilde(token: &str) -> PathBuf {
+    let token = token.trim();
+    if let Some(rest) = token.strip_prefix("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return PathBuf::from(home).join(rest);
+        }
+    }
+    PathBuf::from(token)
+}
+
+/// Resolve one fence entry to a cwd-relative path, or skip if outside the worktree.
+fn entry_relative_to_cwd(raw: &str, cwd_canon: &Path) -> Option<String> {
+    let token = fence_path_token(raw);
+    if token.is_empty() {
+        return None;
+    }
+    let expanded = expand_tilde(token);
+    let path = if expanded.is_absolute() {
+        expanded
+    } else {
+        cwd_canon.join(expanded)
+    };
+    let path = resolved_clean(&path);
+    if !path_starts_with(&path, cwd_canon) {
+        return None;
+    }
+    let rel = path.strip_prefix(cwd_canon).ok()?;
+    let rel_str = normalize_rel(&rel.to_string_lossy());
+    if rel_str.is_empty() {
+        None
+    } else {
+        Some(rel_str)
+    }
 }
 
 fn normalize_rel(path: &str) -> String {
@@ -54,7 +112,7 @@ fn entry_matches(rel: &str, entry: &str) -> bool {
     if rel == entry {
         return true;
     }
-    let prefix = format!("{}/", entry);
+    let prefix = format!("{entry}/");
     rel.starts_with(&prefix)
 }
 
@@ -179,14 +237,24 @@ fn path_starts_with(path: &Path, prefix: &Path) -> bool {
         && path.components().count() >= prefix.components().count()
 }
 
-/// Snapshot fence entries under each `protected_root`.
-pub fn snapshot(protected_roots: &[PathBuf], fence: &[String]) -> Digest {
+fn content_hash(path: &Path) -> u64 {
+    let Ok(bytes) = std::fs::read(path) else {
+        return 0;
+    };
+    let mut hasher = DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Snapshot fence entries under each `protected_root` (worktree-relative entries only).
+pub fn snapshot(protected_roots: &[PathBuf], fence: &[String], cwd: &Path) -> Digest {
     let mut digest = BTreeMap::new();
-    if fence.is_empty() {
+    let rel_entries = worktree_fence_entries(cwd, fence);
+    if rel_entries.is_empty() {
         return digest;
     }
     for root in protected_roots {
-        for entry in fence {
+        for entry in &rel_entries {
             let target = root.join(entry);
             if target.is_file() {
                 record_file(&mut digest, &target);
@@ -204,7 +272,7 @@ fn record_file(digest: &mut Digest, path: &Path) {
             path.to_path_buf(),
             FileMeta {
                 size: meta.len(),
-                modified: meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+                content_hash: content_hash(path),
             },
         );
     }
@@ -249,6 +317,9 @@ pub async fn drift(cwd: &Path, fence: &[String]) -> Vec<String> {
     if fence.is_empty() {
         return Vec::new();
     }
+    if worktree_fence_entries(cwd, fence).is_empty() {
+        return Vec::new();
+    }
     let output = tokio::process::Command::new("git")
         .arg("-C")
         .arg(cwd)
@@ -275,7 +346,7 @@ pub async fn drift(cwd: &Path, fence: &[String]) -> Vec<String> {
         }
         // status may list "a -> b" for renames; take the destination.
         let rel = rel.rsplit(" -> ").next().unwrap_or(rel);
-        if !in_fence(rel, fence) {
+        if !in_fence(rel, cwd, fence) {
             paths.push(rel.to_string());
         }
     }
@@ -313,19 +384,98 @@ pub fn tool_args_from_message(message: &StreamMessage) -> (String, serde_json::M
 mod tests {
     use super::*;
     use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn unique_temp(prefix: &str) -> PathBuf {
+        let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("{prefix}-{}-{n}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
 
     #[test]
     fn in_fence_file_and_dir_prefix() {
-        assert!(in_fence("src/foo.rs", &["src/foo.rs".into()]));
-        assert!(in_fence("src/foo.rs", &["src".into()]));
-        assert!(!in_fence("src/foo.rs", &["src/bar".into()]));
-        assert!(!in_fence("notsrc/foo", &["src".into()]));
+        let cwd = unique_temp("fence-in");
+        assert!(in_fence("src/foo.rs", &cwd, &["src/foo.rs".into()]));
+        assert!(in_fence("src/foo.rs", &cwd, &["src".into()]));
+        assert!(!in_fence("src/foo.rs", &cwd, &["src/bar".into()]));
+        assert!(!in_fence("notsrc/foo", &cwd, &["src".into()]));
+    }
+
+    #[test]
+    fn tilde_fence_entry_under_cwd_matches() {
+        let home = PathBuf::from(std::env::var("HOME").expect("HOME"));
+        let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let cwd = home.join(format!(".cursor-seat-fence-tilde-{}-{n}", std::process::id()));
+        let _ = fs::remove_dir_all(&cwd);
+        fs::create_dir_all(&cwd).unwrap();
+        let file_rel = "marked.txt";
+        fs::write(cwd.join(file_rel), b"x").unwrap();
+        let rel_from_home = cwd.strip_prefix(&home).expect("cwd under HOME");
+        let entry = format!("~/{}/{}", rel_from_home.to_string_lossy(), file_rel);
+        assert!(in_fence(file_rel, &cwd, &[entry]));
+    }
+
+    #[test]
+    fn fence_entry_strips_trailing_prose() {
+        let cwd = unique_temp("fence-prose");
+        fs::write(cwd.join("pre_steer.py"), b"x").unwrap();
+        assert!(in_fence(
+            "pre_steer.py",
+            &cwd,
+            &["pre_steer.py plane_allows".into()],
+        ));
+    }
+
+    #[test]
+    fn absolute_fence_outside_cwd_is_ignored() {
+        let cwd = unique_temp("fence-outside-cwd");
+        let outside = unique_temp("fence-outside-other");
+        let file = outside.join("only.txt");
+        fs::write(&file, b"x").unwrap();
+        let entry = file.display().to_string();
+        assert!(worktree_fence_entries(&cwd, &[entry]).is_empty());
+    }
+
+    #[test]
+    fn fence_only_outside_entries_yields_no_drift() {
+        let cwd = unique_temp("fence-drift-empty");
+        init_git(&cwd);
+        fs::write(cwd.join("dirty.txt"), b"x").unwrap();
+        let outside = unique_temp("fence-drift-out");
+        let entry = outside.join("x").display().to_string();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let paths = rt.block_on(drift(&cwd, &[entry]));
+        assert!(paths.is_empty());
+    }
+
+    fn init_git(dir: &Path) {
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(dir)
+            .output()
+            .expect("git init");
+        std::process::Command::new("git")
+            .args(["config", "user.email", "t@test"])
+            .current_dir(dir)
+            .output()
+            .expect("git config");
+        std::process::Command::new("git")
+            .args(["config", "user.name", "t"])
+            .current_dir(dir)
+            .output()
+            .expect("git config");
     }
 
     #[test]
     fn tool_escape_blocks_edit_outside_cwd() {
-        let cwd = std::env::temp_dir().join("fence-cwd");
-        let _ = fs::create_dir_all(&cwd);
+        let cwd = unique_temp("fence-cwd");
         let args = serde_json::json!({"path": "/etc/passwd"})
             .as_object()
             .unwrap()
@@ -336,8 +486,7 @@ mod tests {
 
     #[test]
     fn tool_escape_allows_read_outside() {
-        let cwd = std::env::temp_dir().join("fence-cwd-read");
-        let _ = fs::create_dir_all(&cwd);
+        let cwd = unique_temp("fence-cwd-read");
         let args = serde_json::json!({"path": "/etc/passwd"})
             .as_object()
             .unwrap()
@@ -346,16 +495,29 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_detects_change() {
-        let dir = std::env::temp_dir().join("fence-snap");
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
+    fn snapshot_detects_content_change() {
+        let dir = unique_temp("fence-snap");
         let file = dir.join("tracked.txt");
         fs::write(&file, b"a").unwrap();
-        let before = snapshot(&[dir.clone()], &["tracked.txt".into()]);
+        let before = snapshot(&[dir.clone()], &["tracked.txt".into()], &dir);
         fs::write(&file, b"ab").unwrap();
-        let after = snapshot(&[dir.clone()], &["tracked.txt".into()]);
+        let after = snapshot(&[dir.clone()], &["tracked.txt".into()], &dir);
         let delta = changed(&before, &after);
         assert_eq!(delta, vec![file]);
+    }
+
+    #[test]
+    fn snapshot_ignores_mtime_only_change() {
+        let dir = unique_temp("fence-snap-mtime");
+        let file = dir.join("tracked.txt");
+        fs::write(&file, b"same").unwrap();
+        let before = snapshot(&[dir.clone()], &["tracked.txt".into()], &dir);
+        fs::write(&file, b"same").unwrap();
+        std::process::Command::new("touch")
+            .arg(&file)
+            .status()
+            .expect("touch");
+        let after = snapshot(&[dir.clone()], &["tracked.txt".into()], &dir);
+        assert!(changed(&before, &after).is_empty());
     }
 }

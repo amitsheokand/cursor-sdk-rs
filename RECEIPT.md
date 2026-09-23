@@ -1,39 +1,32 @@
 sdkrun_v1
 
-## Files changed
+## Files changed (review fixes)
 
-- `seat/src/fence.rs` (new)
-- `seat/src/lib.rs`
-- `seat/src/main.rs`
-- `seat/src/protocol.rs`
+- `seat/src/fence.rs`
 - `seat/src/run.rs`
-- `seat/src/context.rs`
-- `seat/PROTOCOL.md`
-- `seat/tests/fence_run.rs` (new)
+- `seat/src/protocol.rs`
 - `seat/tests/support/mod.rs`
-- `seat/tests/seat_run.rs`
-- `seat/tests/protocol_golden.rs`
-- `seat/tests/jev_run.rs`
-- `seat/tests/session_run.rs`
+- `RECEIPT.md`
 
-## New tests
+## New / updated tests
 
-- `edit_outside_cwd_bounces_and_cancels`
-- `shell_cwd_outside_bounces_and_cancels`
-- `read_outside_cwd_is_allowed`
-- `protected_root_change_bounces`
-- `out_of_fence_git_drift_gets_one_correction_then_fails`
-- `in_fence_git_change_stays_ok`
-- `request_without_fence_fields_round_trips`
-- `fence::in_fence_file_and_dir_prefix`
-- `fence::tool_escape_blocks_edit_outside_cwd`
-- `fence::tool_escape_allows_read_outside`
-- `fence::snapshot_detects_change`
+- `workspace_dir` uniqueness (pid + counter, remove before create)
+- `tilde_fence_entry_under_cwd_matches`
+- `fence_entry_strips_trailing_prose`
+- `absolute_fence_outside_cwd_is_ignored`
+- `fence_only_outside_entries_yields_no_drift`
+- `snapshot_ignores_mtime_only_change`
+- `snapshot_detects_content_change` (renamed from mtime-based)
 
-## cargo test -p cursor-seat (last lines)
+## cargo test -p cursor-seat (two consecutive runs, last ~10 lines each)
 
+Run 1:
 ```
-test result: ok. 97 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.20s
+test ready_session_sends_normally_and_records ... ok
+test live_run_attaches_instead_of_resending ... ok
+test terminal_result_replays_with_no_bridge_contact ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
 
    Doc-tests cursor_seat
 
@@ -41,3 +34,20 @@ running 0 tests
 
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 ```
+
+Run 2:
+```
+test live_run_attaches_instead_of_resending ... ok
+test terminal_result_replays_with_no_bridge_contact ... ok
+test ready_session_sends_normally_and_records ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests cursor_seat
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+```
+
+(Suite totals: 102 tests per run, all passed.)

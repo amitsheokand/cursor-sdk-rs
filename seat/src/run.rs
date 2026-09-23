@@ -349,7 +349,7 @@ pub async fn run_seat(
     let protected_before = if protected_roots.is_empty() {
         None
     } else {
-        Some(snapshot(&protected_roots, &request.fence))
+        Some(snapshot(&protected_roots, &request.fence, &cwd))
     };
 
     // Phase D: open the stream on the same agent across retries.
@@ -404,7 +404,7 @@ pub async fn run_seat(
     .await;
 
     if let Some(before) = protected_before.as_ref() {
-        let after = snapshot(&protected_roots, &request.fence);
+        let after = snapshot(&protected_roots, &request.fence, &cwd);
         let paths = changed(before, &after);
         if !paths.is_empty() {
             result = fence_escape_result(
