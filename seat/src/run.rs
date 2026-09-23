@@ -29,7 +29,7 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 
 use crate::clip::{archive_text, bound_output, bound_output_with_path};
-use crate::fence::{changed, drift, snapshot, Digest};
+use crate::fence::{attribute, changed, drift, rebaseline_entries, snapshot, Digest};
 use crate::context::build_context;
 use crate::inbox::Inbox;
 use crate::jev::{
@@ -411,7 +411,6 @@ pub async fn run_seat(
         &cwd,
         &allowed_extra,
         &protected_roots,
-        protected_before.as_ref(),
         result,
         flags,
         built.changes.clone(),
@@ -902,12 +901,11 @@ async fn attach(
                 },
             )
             .await;
-            let (result, _) = apply_post_drive_fence(
+            let (result, _flags) = apply_post_drive_fence(
                 request,
                 &cwd,
                 &allowed_extra,
                 &protected_roots,
-                protected_before.as_ref(),
                 result,
                 flags,
                 context_changes,
@@ -960,6 +958,8 @@ struct DriveFence {
 struct DriveFlags {
     when_idle: bool,
     effort: Option<String>,
+    protected_baseline: Option<Digest>,
+    fence_external_emitted: HashSet<String>,
 }
 
 impl From<&DriveState> for DriveFlags {
@@ -967,6 +967,8 @@ impl From<&DriveState> for DriveFlags {
         DriveFlags {
             when_idle: state.when_idle,
             effort: state.effort.clone(),
+            protected_baseline: state.protected_baseline.clone(),
+            fence_external_emitted: state.fence_external_emitted.clone(),
         }
     }
 }
@@ -1000,6 +1002,9 @@ async fn drive(
     state.start = Some(wall_start);
     // Baseline snapshot was just taken; debounce mid-run samples (incl. interval's first tick).
     state.last_protected_snapshot = Some(Instant::now());
+    if fence.protected_baseline.is_some() {
+        state.protected_baseline = fence.protected_baseline.clone();
+    }
     if let Some((run_id, agent_id)) = attached {
         // Resumed attach: the run is live remotely (ObserveRun
         // succeeded), so announce it up front. Controls queued before the
@@ -1169,6 +1174,8 @@ struct DriveState {
     fence_escape: Option<String>,
     last_protected_snapshot: Option<Instant>,
     fence_checked_tool_calls: HashSet<String>,
+    protected_baseline: Option<Digest>,
+    fence_external_emitted: HashSet<String>,
 }
 
 /// Record run/agent ids; on first sight emit `run_started` and fire a
@@ -1265,7 +1272,6 @@ async fn apply_post_drive_fence(
     cwd: &Path,
     allowed_extra: &[PathBuf],
     protected_roots: &[PathBuf],
-    protected_before: Option<&Digest>,
     mut result: SeatResult,
     mut flags: DriveFlags,
     context_changes: Vec<crate::protocol::ContextChange>,
@@ -1280,25 +1286,44 @@ async fn apply_post_drive_fence(
     guard_tools: bool,
     emit: &mut dyn FnMut(SeatEventKind),
 ) -> (SeatResult, DriveFlags) {
-    if let Some(before) = protected_before {
+    let mut protected_baseline = flags.protected_baseline.take();
+    let mut fence_external_emitted = std::mem::take(&mut flags.fence_external_emitted);
+    if let Some(before) = protected_baseline.as_ref() {
         let Some(after) = snapshot_async(protected_roots, &request.fence, cwd).await else {
+            flags.protected_baseline = protected_baseline;
+            flags.fence_external_emitted = fence_external_emitted;
             return (result, flags);
         };
-        let paths = changed(before, &after);
-        if !paths.is_empty() {
-            result = fence_escape_result(
-                request,
-                &paths
-                    .iter()
-                    .map(|p| p.display().to_string())
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                &result,
-                attempts,
-                wall_start,
-                context_changes,
-                session,
-            );
+        let changed_paths = changed(before, &after);
+        if !changed_paths.is_empty() {
+            let roots = protected_roots.to_vec();
+            let cwd_buf = cwd.to_path_buf();
+            let after_copy = after.clone();
+            let classified = tokio::task::spawn_blocking(move || {
+                attribute(&changed_paths, &after_copy, &roots, &cwd_buf)
+            })
+            .await;
+            if let Ok((escapes, external)) = classified {
+                if let Some(base) = protected_baseline.as_mut() {
+                    rebaseline_entries(base, &after, &external);
+                }
+                emit_fence_external(&external, &mut fence_external_emitted, emit);
+                if !escapes.is_empty() {
+                    result = fence_escape_result(
+                        request,
+                        &escapes
+                            .iter()
+                            .map(|p| p.display().to_string())
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        &result,
+                        attempts,
+                        wall_start,
+                        context_changes,
+                        session,
+                    );
+                }
+            }
         }
     }
 
@@ -1339,12 +1364,15 @@ async fn apply_post_drive_fence(
                             guard_tools,
                             protected_roots: protected_roots.to_vec(),
                             fence_entries: request.fence.clone(),
-                            protected_baseline: protected_before.cloned(),
+                            protected_baseline: protected_baseline.clone(),
                         },
                     )
                     .await;
                     result = next_result;
-                    flags = next_flags;
+                    flags.when_idle = next_flags.when_idle;
+                    flags.effort = next_flags.effort;
+                    protected_baseline = next_flags.protected_baseline;
+                    fence_external_emitted = next_flags.fence_external_emitted;
                     if result.outcome == Outcome::Ok {
                         drift_paths = drift(cwd, &request.fence).await;
                     }
@@ -1374,7 +1402,15 @@ async fn apply_post_drive_fence(
         }
     }
 
-    (result, flags)
+    (
+        result,
+        DriveFlags {
+            when_idle: flags.when_idle,
+            effort: flags.effort,
+            protected_baseline,
+            fence_external_emitted,
+        },
+    )
 }
 
 fn tool_fence_hit(
@@ -1429,6 +1465,23 @@ async fn emit_fence_escape(
     }
 }
 
+fn emit_fence_external(
+    paths: &[PathBuf],
+    emitted: &mut HashSet<String>,
+    emit: &mut dyn FnMut(SeatEventKind),
+) {
+    for path in paths {
+        let key = path.display().to_string();
+        if emitted.insert(key.clone()) {
+            emit(SeatEventKind::Fence {
+                kind: "external".to_string(),
+                path: key,
+                tool: String::new(),
+            });
+        }
+    }
+}
+
 async fn maybe_protected_snapshot_escape(
     fence: &DriveFence,
     state: &mut DriveState,
@@ -1439,7 +1492,7 @@ async fn maybe_protected_snapshot_escape(
     if state.fence_escape.is_some() || fence.protected_roots.is_empty() {
         return;
     }
-    let Some(before) = fence.protected_baseline.as_ref() else {
+    let Some(before) = state.protected_baseline.as_ref() else {
         return;
     };
     let now = Instant::now();
@@ -1455,12 +1508,27 @@ async fn maybe_protected_snapshot_escape(
     else {
         return;
     };
-    let paths = changed(before, &after);
-    if paths.is_empty() {
+    let changed_paths = changed(before, &after);
+    if changed_paths.is_empty() {
         return;
     }
-    let path = paths[0].clone();
-    emit_fence_escape(&path, "", state, handles, session, emit).await;
+    let roots = fence.protected_roots.clone();
+    let cwd = fence.cwd.clone();
+    let after_copy = after.clone();
+    let classified = tokio::task::spawn_blocking(move || {
+        attribute(&changed_paths, &after_copy, &roots, &cwd)
+    })
+    .await;
+    let Ok((escapes, external)) = classified else {
+        return;
+    };
+    if let Some(base) = state.protected_baseline.as_mut() {
+        rebaseline_entries(base, &after, &external);
+    }
+    emit_fence_external(&external, &mut state.fence_external_emitted, emit);
+    if let Some(path) = escapes.first() {
+        emit_fence_escape(path, "", state, handles, session, emit).await;
+    }
 }
 
 fn fence_escape_result(

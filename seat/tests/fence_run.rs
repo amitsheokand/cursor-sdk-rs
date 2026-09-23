@@ -346,6 +346,8 @@ async fn tool_call_completion_runs_protected_snapshot_when_due() {
     let cwd = workspace_dir();
     let protected = workspace_dir();
     let tracked = protected.join("mirror.txt");
+    let agent_body = b"agent-copy";
+    fs::write(cwd.join("mirror.txt"), agent_body).unwrap();
     fs::write(&tracked, b"before").unwrap();
 
     let bridge = FakeBridge::start().await;
@@ -425,7 +427,7 @@ async fn tool_call_completion_runs_protected_snapshot_when_due() {
             event = rx.recv() => match event {
                 Some(event) => {
                     if matches!(&event.kind, SeatEventKind::RunStarted { .. }) {
-                        fs::write(&tracked_mut, b"after").unwrap();
+                        fs::write(&tracked_mut, agent_body).unwrap();
                     }
                     if let SeatEventKind::Result(r) = event.kind {
                         result = Some(r);
@@ -489,6 +491,8 @@ async fn protected_root_midrun_escape_after_tool_call() {
     let cwd = workspace_dir();
     let protected = workspace_dir();
     let tracked = protected.join("mirror.txt");
+    let agent_body = b"agent-copy";
+    fs::write(cwd.join("mirror.txt"), agent_body).unwrap();
     fs::write(&tracked, b"before").unwrap();
 
     let bridge = FakeBridge::start().await;
@@ -556,7 +560,7 @@ async fn protected_root_midrun_escape_after_tool_call() {
             event = rx.recv() => match event {
                 Some(event) => {
                     if matches!(&event.kind, SeatEventKind::RunStarted { .. }) {
-                        fs::write(&tracked_mut, b"after").unwrap();
+                        fs::write(&tracked_mut, agent_body).unwrap();
                     }
                     if matches!(&event.kind, SeatEventKind::Fence { kind, .. } if kind == "escape") {
                         escape_events += 1;
@@ -881,6 +885,7 @@ async fn protected_root_change_bounces() {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let run_fut = run_seat(&client, req, inbox, tx, None);
     tokio::pin!(run_fut);
+    let mut events = Vec::new();
     let mut result = None;
     loop {
         tokio::select! {
@@ -892,6 +897,7 @@ async fn protected_root_change_bounces() {
                     if matches!(&event.kind, SeatEventKind::RunStarted { .. }) {
                         fs::write(&tracked_mut, b"after").unwrap();
                     }
+                    events.push(event.clone());
                     if let SeatEventKind::Result(r) = event.kind {
                         result = Some(r);
                     }
@@ -904,8 +910,276 @@ async fn protected_root_change_bounces() {
         }
     }
     let result = result.expect("result");
+    assert_eq!(result.outcome, Outcome::Ok);
+    assert_eq!(fence_kind_count(&events, "external"), 1);
+    assert_eq!(bridge.call_count("SdkAgentService/CancelRun"), 0);
+}
+
+fn fence_kind_count(events: &[cursor_seat::protocol::SeatEvent], kind: &str) -> usize {
+    events
+        .iter()
+        .filter(|e| matches!(&e.kind, SeatEventKind::Fence { kind: k, .. } if k == kind))
+        .count()
+}
+
+#[tokio::test]
+async fn protected_root_midrun_external_edit_notices_once() {
+    let cwd = workspace_dir();
+    let protected = workspace_dir();
+    let tracked = protected.join("mirror.txt");
+    fs::write(&tracked, b"before").unwrap();
+
+    let bridge = FakeBridge::start().await;
+    script_models_create_close(&bridge);
+    let mut timed = vec![(
+        Duration::ZERO,
+        sdk_message_frame(
+            "system",
+            json!({"run_id": "run_1", "agent_id": "agent_1"}),
+            Some("o1"),
+        ),
+    )];
+    timed.push((
+        Duration::from_millis(1100),
+        sdk_message_frame(
+            "tool_call",
+            json!({
+                "name": "read",
+                "args": {"path": cwd.join("in.txt").display().to_string()},
+                "status": "completed",
+                "call_id": "c1",
+            }),
+            Some("o2"),
+        ),
+    ));
+    timed.extend((0..32).map(|_| (Duration::ZERO, keepalive_frame())));
+    timed.push((
+        Duration::ZERO,
+        result_frame(
+            "agent_1",
+            "run_1",
+            proto::RunLifecycleStatus::Finished,
+            "done",
+        ),
+    ));
+    timed.push((Duration::ZERO, done_frame("agent_1", "run_1")));
+    bridge.expect("SdkAgentService/Send", Reply::StreamTimed(timed));
+
+    let mut req = fenced_request(
+        cwd.clone(),
+        vec!["mirror.txt".into()],
+        vec![protected.to_string_lossy().into_owned()],
+    );
+    req.limits.heartbeat_s = 1;
+    fs::write(cwd.join("in.txt"), b"ok").unwrap();
+
+    let tracked_mut = tracked.clone();
+    let client = client_for(&bridge);
+    let inbox = Inbox::new(&[]).unwrap();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let run_fut = run_seat(&client, req, inbox, tx, None);
+    tokio::pin!(run_fut);
+    let mut events = Vec::new();
+    let mut result = None;
+    loop {
+        tokio::select! {
+            outcome = &mut run_fut, if result.is_none() => {
+                result = Some(outcome);
+            }
+            event = rx.recv() => match event {
+                Some(event) => {
+                    if matches!(&event.kind, SeatEventKind::RunStarted { .. }) {
+                        fs::write(&tracked_mut, b"owner-edit").unwrap();
+                    }
+                    events.push(event.clone());
+                    if let SeatEventKind::Result(r) = event.kind {
+                        result = Some(r);
+                    }
+                }
+                None => break,
+            },
+        }
+        if result.is_some() {
+            break;
+        }
+    }
+    let result = result.expect("result");
+    assert_eq!(result.outcome, Outcome::Ok);
+    assert_eq!(fence_kind_count(&events, "external"), 1);
+    assert_eq!(fence_kind_count(&events, "escape"), 0);
+    assert_eq!(bridge.call_count("SdkAgentService/CancelRun"), 0);
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(fence_kind_count(&events, "external"), 1);
+}
+
+#[tokio::test]
+async fn protected_root_external_then_agent_copy_escapes() {
+    let cwd = workspace_dir();
+    let protected = workspace_dir();
+    let tracked = protected.join("mirror.txt");
+    let agent_body = b"agent-copy";
+    fs::write(cwd.join("mirror.txt"), agent_body).unwrap();
+    fs::write(&tracked, b"before").unwrap();
+
+    let bridge = FakeBridge::start().await;
+    script_models_create_close(&bridge);
+    bridge.always(
+        "SdkAgentService/CancelRun",
+        Reply::unary(&proto::CancelRunResponse {}),
+    );
+    let mut timed = vec![(
+        Duration::ZERO,
+        sdk_message_frame(
+            "system",
+            json!({"run_id": "run_1", "agent_id": "agent_1"}),
+            Some("o1"),
+        ),
+    )];
+    timed.push((
+        Duration::from_millis(1100),
+        sdk_message_frame(
+            "tool_call",
+            json!({
+                "name": "read",
+                "args": {"path": cwd.join("in.txt").display().to_string()},
+                "status": "completed",
+                "call_id": "c1",
+            }),
+            Some("o2"),
+        ),
+    ));
+    timed.extend((0..32).map(|_| (Duration::ZERO, keepalive_frame())));
+    timed.push((
+        Duration::from_millis(2200),
+        result_frame(
+            "agent_1",
+            "run_1",
+            proto::RunLifecycleStatus::Cancelled,
+            "",
+        ),
+    ));
+    timed.push((Duration::ZERO, done_frame("agent_1", "run_1")));
+    bridge.expect("SdkAgentService/Send", Reply::StreamTimed(timed));
+
+    let mut req = fenced_request(
+        cwd.clone(),
+        vec!["mirror.txt".into()],
+        vec![protected.to_string_lossy().into_owned()],
+    );
+    req.limits.heartbeat_s = 1;
+    fs::write(cwd.join("in.txt"), b"ok").unwrap();
+
+    let tracked_mut = tracked.clone();
+    let client = client_for(&bridge);
+    let inbox = Inbox::new(&[]).unwrap();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let run_fut = run_seat(&client, req, inbox, tx, None);
+    tokio::pin!(run_fut);
+    let mut events = Vec::new();
+    let mut result = None;
+    loop {
+        tokio::select! {
+            outcome = &mut run_fut, if result.is_none() => {
+                result = Some(outcome);
+            }
+            event = rx.recv() => match event {
+                Some(event) => {
+                    if matches!(&event.kind, SeatEventKind::RunStarted { .. }) {
+                        fs::write(&tracked_mut, b"owner-edit").unwrap();
+                    }
+                    if matches!(&event.kind, SeatEventKind::Fence { kind, .. } if kind == "external") {
+                        fs::write(&tracked_mut, agent_body).unwrap();
+                    }
+                    events.push(event.clone());
+                    if let SeatEventKind::Result(r) = event.kind {
+                        result = Some(r);
+                    }
+                }
+                None => break,
+            },
+        }
+        if result.is_some() {
+            break;
+        }
+    }
+    let result = result.expect("result");
+    assert_eq!(fence_kind_count(&events, "external"), 1);
+    assert_eq!(fence_kind_count(&events, "escape"), 1);
     assert_eq!(result.outcome, Outcome::Bounced);
-    assert_eq!(result.error_kind.as_deref(), Some("FenceEscape"));
+    assert_eq!(bridge.call_count("SdkAgentService/CancelRun"), 1);
+}
+
+#[tokio::test]
+async fn protected_root_post_drive_external_only() {
+    let cwd = workspace_dir();
+    let protected = workspace_dir();
+    let tracked = protected.join("mirror.txt");
+    fs::write(&tracked, b"before").unwrap();
+
+    let bridge = FakeBridge::start().await;
+    script_models_create_close(&bridge);
+    bridge.expect(
+        "SdkAgentService/Send",
+        Reply::Stream(vec![
+            sdk_message_frame(
+                "system",
+                json!({"run_id": "run_1", "agent_id": "agent_1"}),
+                Some("o1"),
+            ),
+            sdk_message_frame(
+                "assistant",
+                json!({"message": {"content": [{"type": "text", "text": "working"}]}}),
+                Some("o2"),
+            ),
+            result_frame(
+                "agent_1",
+                "run_1",
+                proto::RunLifecycleStatus::Finished,
+                "done",
+            ),
+            done_frame("agent_1", "run_1"),
+        ]),
+    );
+
+    let req = fenced_request(
+        cwd,
+        vec!["mirror.txt".into()],
+        vec![protected.to_string_lossy().into_owned()],
+    );
+    let tracked_mut = tracked.clone();
+    let client = client_for(&bridge);
+    let inbox = Inbox::new(&[]).unwrap();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let run_fut = run_seat(&client, req, inbox, tx, None);
+    tokio::pin!(run_fut);
+    let mut events = Vec::new();
+    let mut result = None;
+    loop {
+        tokio::select! {
+            outcome = &mut run_fut, if result.is_none() => {
+                result = Some(outcome);
+            }
+            event = rx.recv() => match event {
+                Some(event) => {
+                    if matches!(&event.kind, SeatEventKind::RunStarted { .. }) {
+                        fs::write(&tracked_mut, b"owner-post").unwrap();
+                    }
+                    events.push(event.clone());
+                    if let SeatEventKind::Result(r) = event.kind {
+                        result = Some(r);
+                    }
+                }
+                None => break,
+            }
+        }
+        if result.is_some() {
+            break;
+        }
+    }
+    let result = result.expect("result");
+    assert_eq!(result.outcome, Outcome::Ok);
+    assert_eq!(fence_kind_count(&events, "external"), 1);
+    assert_eq!(fence_kind_count(&events, "escape"), 0);
 }
 
 #[tokio::test]

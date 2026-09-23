@@ -74,8 +74,9 @@ run failures arrives in P4. Controls arriving after the result are moot
 - `resumed {run_id}`
 - `jev {check, verdict, p}` (`check` names the TOML question;
   `verdict` is the Choice/Noul outcome; `p` its probability)
-- `fence {kind, path, tool}` (`kind` is `escape` or `drift`; `path` is the
-  offending path; `tool` is the tool name when applicable)
+- `fence {kind, path, tool}` (`kind` is `escape`, `external`, or `drift`; `path` is the
+  offending path; `tool` is the tool name when applicable). `external` is a notice
+  only (outcome unchanged).
 - Live escape checks inspect tool path/`cwd` arguments. For shell tools, the
   seat also tokenizes the command string (`command` / `cmd` / `script`, including
   nested `arguments`) on whitespace and shell metacharacters, and treats
@@ -88,8 +89,13 @@ run failures arrives in P4. Controls arriving after the result are moot
   `cwd` or `session_dir`.
 - During the drive loop, protected-root snapshots are re-run after each
   `tool_call` (debounced to at most once per second) and on every heartbeat
-  tick; any change from the pre-run baseline emits `fence` `escape` and
-  cancels the run. The post-drive snapshot remains as a backstop.
+  tick. Changes from the baseline are attributed: if a changed protected file
+  is a regular file whose content hash matches the worktree copy at the same
+  relative path, that is an agent copy (`fence` `escape`, run cancelled). Any
+  other change (different content, deletion, symlink, missing worktree file) is
+  external: one `fence` `external` event per path, baseline updated so the same
+  edit is not re-reported, outcome unchanged. The post-drive snapshot uses the
+  same attribution as a backstop (`escape` only changes the outcome).
 - final `result`
 
 `result`: `outcome: ok|failed|startup_error|busy|bounced|stale`,

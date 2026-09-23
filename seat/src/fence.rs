@@ -805,6 +805,73 @@ fn walk_dir(digest: &mut Digest, dir: &Path) {
     }
 }
 
+fn containing_protected_root<'a>(path: &Path, roots: &'a [PathBuf]) -> Option<&'a PathBuf> {
+    for root in roots {
+        let lexical_root = lexically_normalize(root);
+        let canon_root = resolved_clean(root);
+        if path_under_root(path, &lexical_root) || path_under_root(path, &canon_root) {
+            return Some(root);
+        }
+    }
+    None
+}
+
+fn is_regular_file(path: &Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .ok()
+        .is_some_and(|meta| meta.file_type().is_file() && !meta.file_type().is_symlink())
+}
+
+/// Classify protected-root snapshot deltas: agent copy (worktree hash match) vs external.
+pub fn attribute(
+    changed: &[PathBuf],
+    after: &Digest,
+    roots: &[PathBuf],
+    cwd: &Path,
+) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let mut escapes = Vec::new();
+    let mut external = Vec::new();
+    for path in changed {
+        let Some(root) = containing_protected_root(path, roots) else {
+            external.push(path.clone());
+            continue;
+        };
+        let Ok(rel) = path.strip_prefix(root) else {
+            external.push(path.clone());
+            continue;
+        };
+        let worktree_copy = cwd.join(rel);
+        if !is_regular_file(path) || !is_regular_file(&worktree_copy) {
+            external.push(path.clone());
+            continue;
+        }
+        let Some(protected_meta) = after.get(path) else {
+            external.push(path.clone());
+            continue;
+        };
+        if protected_meta.content_hash == content_hash(&worktree_copy) {
+            escapes.push(path.clone());
+        } else {
+            external.push(path.clone());
+        }
+    }
+    (escapes, external)
+}
+
+/// Advance the mid-run baseline for externally changed paths so they are not re-reported.
+pub fn rebaseline_entries(baseline: &mut Digest, after: &Digest, paths: &[PathBuf]) {
+    for path in paths {
+        match after.get(path) {
+            Some(meta) => {
+                baseline.insert(path.clone(), meta.clone());
+            }
+            None => {
+                baseline.remove(path);
+            }
+        }
+    }
+}
+
 /// Paths whose metadata changed between two snapshots.
 pub fn changed(before: &Digest, after: &Digest) -> Vec<PathBuf> {
     let mut out = Vec::new();
@@ -1063,6 +1130,88 @@ mod tests {
         let after = snapshot(&[dir.clone()], &["tracked.txt".into()], &dir);
         let delta = changed(&before, &after);
         assert_eq!(delta, vec![file]);
+    }
+
+    #[test]
+    fn attribute_worktree_copy_is_escape() {
+        let wt = unique_temp("attr-wt");
+        let root = unique_temp("attr-root");
+        fs::write(wt.join("f.txt"), b"same").unwrap();
+        fs::write(root.join("f.txt"), b"old").unwrap();
+        let roots = vec![root.clone()];
+        let before = snapshot(&roots, &["f.txt".into()], &wt);
+        fs::write(root.join("f.txt"), b"same").unwrap();
+        let after = snapshot(&roots, &["f.txt".into()], &wt);
+        let delta = changed(&before, &after);
+        let (escapes, external) = attribute(&delta, &after, &roots, &wt);
+        assert_eq!(external, Vec::<PathBuf>::new());
+        assert_eq!(escapes, vec![root.join("f.txt")]);
+    }
+
+    #[test]
+    fn attribute_different_content_is_external() {
+        let wt = unique_temp("attr-wt-diff");
+        let root = unique_temp("attr-root-diff");
+        fs::write(wt.join("f.txt"), b"wt").unwrap();
+        fs::write(root.join("f.txt"), b"old").unwrap();
+        let roots = vec![root.clone()];
+        let before = snapshot(&roots, &["f.txt".into()], &wt);
+        fs::write(root.join("f.txt"), b"owner").unwrap();
+        let after = snapshot(&roots, &["f.txt".into()], &wt);
+        let delta = changed(&before, &after);
+        let (escapes, external) = attribute(&delta, &after, &roots, &wt);
+        assert!(escapes.is_empty());
+        assert_eq!(external, vec![root.join("f.txt")]);
+    }
+
+    #[test]
+    fn attribute_missing_worktree_is_external() {
+        let wt = unique_temp("attr-wt-miss");
+        let root = unique_temp("attr-root-miss");
+        fs::write(root.join("f.txt"), b"old").unwrap();
+        let roots = vec![root.clone()];
+        let before = snapshot(&roots, &["f.txt".into()], &wt);
+        fs::write(root.join("f.txt"), b"new").unwrap();
+        let after = snapshot(&roots, &["f.txt".into()], &wt);
+        let delta = changed(&before, &after);
+        let (escapes, external) = attribute(&delta, &after, &roots, &wt);
+        assert!(escapes.is_empty());
+        assert_eq!(external.len(), 1);
+    }
+
+    #[test]
+    fn attribute_deletion_in_root_is_external() {
+        let wt = unique_temp("attr-wt-del");
+        let root = unique_temp("attr-root-del");
+        fs::write(wt.join("f.txt"), b"x").unwrap();
+        fs::write(root.join("f.txt"), b"x").unwrap();
+        let roots = vec![root.clone()];
+        let before = snapshot(&roots, &["f.txt".into()], &wt);
+        fs::remove_file(root.join("f.txt")).unwrap();
+        let after = snapshot(&roots, &["f.txt".into()], &wt);
+        let delta = changed(&before, &after);
+        let (escapes, external) = attribute(&delta, &after, &roots, &wt);
+        assert!(escapes.is_empty());
+        assert_eq!(external, vec![root.join("f.txt")]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn attribute_symlink_in_root_is_external() {
+        use std::os::unix::fs::symlink;
+        let wt = unique_temp("attr-wt-link");
+        let root = unique_temp("attr-root-link");
+        fs::write(wt.join("f.txt"), b"x").unwrap();
+        fs::write(root.join("f.txt"), b"x").unwrap();
+        let roots = vec![root.clone()];
+        let before = snapshot(&roots, &["f.txt".into()], &wt);
+        fs::remove_file(root.join("f.txt")).unwrap();
+        symlink(wt.join("f.txt"), root.join("f.txt")).unwrap();
+        let after = snapshot(&roots, &["f.txt".into()], &wt);
+        let delta = changed(&before, &after);
+        let (escapes, external) = attribute(&delta, &after, &roots, &wt);
+        assert!(escapes.is_empty());
+        assert_eq!(external, vec![root.join("f.txt")]);
     }
 
     #[test]
