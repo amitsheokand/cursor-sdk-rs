@@ -117,13 +117,14 @@ pub fn tool_escape(
     args: &serde_json::Map<String, Value>,
     cwd: &Path,
     allowed_extra: &[PathBuf],
+    protected_roots: &[PathBuf],
 ) -> Option<PathBuf> {
     let name = tool_name.trim().to_lowercase();
     if is_read_only(&name) {
         return None;
     }
     if name == "shell" || name.ends_with("shell") {
-        return shell_escape(args, cwd, allowed_extra);
+        return shell_escape(args, cwd, allowed_extra, protected_roots);
     }
     if !is_writing_tool(&name) {
         return None;
@@ -193,13 +194,179 @@ fn shell_escape(
     args: &serde_json::Map<String, Value>,
     cwd: &Path,
     allowed_extra: &[PathBuf],
+    protected_roots: &[PathBuf],
 ) -> Option<PathBuf> {
-    const KEYS: &[&str] = &["cwd", "working_directory", "workingDirectory"];
-    for key in KEYS {
+    const CWD_KEYS: &[&str] = &["cwd", "working_directory", "workingDirectory"];
+    for key in CWD_KEYS {
         if let Some(value) = args.get(*key).and_then(Value::as_str) {
             let trimmed = value.trim();
             if !trimmed.is_empty() {
                 if let Some(hit) = resolve_escape(trimmed, cwd, allowed_extra) {
+                    return Some(hit);
+                }
+            }
+        }
+    }
+    if protected_roots.is_empty() {
+        return None;
+    }
+    for cmd in shell_command_strings(args) {
+        if let Some(hit) = shell_command_protected_escape(&cmd, cwd, allowed_extra, protected_roots)
+        {
+            return Some(hit);
+        }
+    }
+    None
+}
+
+const SHELL_CMD_KEYS: &[&str] = &["command", "cmd", "script"];
+
+fn shell_command_strings(args: &serde_json::Map<String, Value>) -> Vec<String> {
+    let mut out = Vec::new();
+    for key in SHELL_CMD_KEYS {
+        if let Some(value) = args.get(*key).and_then(Value::as_str) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                out.push(trimmed.to_string());
+            }
+        }
+    }
+    if let Some(Value::Object(nested)) = args.get("arguments") {
+        for key in SHELL_CMD_KEYS {
+            if let Some(value) = nested.get(*key).and_then(Value::as_str) {
+                let trimmed = value.trim();
+                if !trimmed.is_empty() {
+                    out.push(trimmed.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+fn is_shell_metachar(ch: char) -> bool {
+    ch.is_whitespace()
+        || matches!(ch, ';' | '|' | '&' | '<' | '>' | '(' | ')' | '\'' | '"' | '\\' | '\n' | '`')
+}
+
+/// Split a shell command on whitespace and shell metacharacters (quotes delimit only).
+pub fn tokenize_shell_command(cmd: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    for ch in cmd.chars() {
+        if is_shell_metachar(ch) {
+            if !current.is_empty() {
+                tokens.push(current.clone());
+                current.clear();
+            }
+        } else {
+            current.push(ch);
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
+fn path_candidates_from_token(token: &str) -> Vec<String> {
+    let trimmed = token.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    let unquoted = trimmed.trim_matches(|c| c == '\'' || c == '"');
+    let mut out = vec![unquoted.to_string()];
+    if let Some((_, value)) = unquoted.split_once('=') {
+        let v = value.trim_matches(|c| c == '\'' || c == '"');
+        if !v.is_empty() {
+            out.push(v.to_string());
+        }
+    }
+    out
+}
+
+fn is_absolute_or_home_spelling(token: &str) -> bool {
+    let t = token.trim().trim_matches(|c| c == '\'' || c == '"');
+    t.starts_with('/')
+        || t.starts_with('~')
+        || t.starts_with("$HOME")
+        || t.starts_with("${HOME}")
+}
+
+/// Lexical path for an absolute or home-relative shell token (no symlink follow).
+fn lexical_shell_path(token: &str) -> Option<PathBuf> {
+    let t = token.trim().trim_matches(|c| c == '\'' || c == '"');
+    if t.starts_with('/') {
+        return Some(lexically_normalize(Path::new(t)));
+    }
+    if t == "~" {
+        if let Ok(home) = std::env::var("HOME") {
+            return Some(lexically_normalize(Path::new(&home)));
+        }
+        return None;
+    }
+    if let Some(rest) = t.strip_prefix("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return Some(lexically_normalize(&PathBuf::from(home).join(rest)));
+        }
+        return None;
+    }
+    if t == "$HOME" || t == "${HOME}" {
+        if let Ok(home) = std::env::var("HOME") {
+            return Some(lexically_normalize(Path::new(&home)));
+        }
+        return None;
+    }
+    if let Some(rest) = t.strip_prefix("$HOME/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return Some(lexically_normalize(&PathBuf::from(home).join(rest)));
+        }
+        return None;
+    }
+    if let Some(rest) = t.strip_prefix("${HOME}/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return Some(lexically_normalize(&PathBuf::from(home).join(rest)));
+        }
+    }
+    None
+}
+
+fn path_under_root(path: &Path, root: &Path) -> bool {
+    path == root || path_starts_with(path, root)
+}
+
+fn hits_protected_root(
+    path: &Path,
+    protected_roots: &[PathBuf],
+    cwd: &Path,
+    allowed_extra: &[PathBuf],
+) -> Option<PathBuf> {
+    if path_allowed(path, cwd, allowed_extra) {
+        return None;
+    }
+    for root in protected_roots {
+        let lexical_root = lexically_normalize(root);
+        let canon_root = resolved_clean(root);
+        if path_under_root(path, &lexical_root) || path_under_root(path, &canon_root) {
+            return Some(path.to_path_buf());
+        }
+    }
+    None
+}
+
+fn shell_command_protected_escape(
+    cmd: &str,
+    cwd: &Path,
+    allowed_extra: &[PathBuf],
+    protected_roots: &[PathBuf],
+) -> Option<PathBuf> {
+    for token in tokenize_shell_command(cmd) {
+        for candidate in path_candidates_from_token(&token) {
+            if !is_absolute_or_home_spelling(&candidate) {
+                continue;
+            }
+            if let Some(path) = lexical_shell_path(&candidate) {
+                if let Some(hit) = hits_protected_root(&path, protected_roots, cwd, allowed_extra) {
                     return Some(hit);
                 }
             }
@@ -692,7 +859,7 @@ mod tests {
             .as_object()
             .unwrap()
             .clone();
-        let hit = tool_escape("edit", &args, &cwd, &[]);
+        let hit = tool_escape("edit", &args, &cwd, &[], &[]);
         assert!(hit.is_some());
     }
 
@@ -703,7 +870,7 @@ mod tests {
             .as_object()
             .unwrap()
             .clone();
-        assert!(tool_escape("read", &args, &cwd, &[]).is_none());
+        assert!(tool_escape("read", &args, &cwd, &[], &[]).is_none());
     }
 
     #[test]
@@ -731,7 +898,7 @@ mod tests {
             .as_object()
             .unwrap()
             .clone();
-        assert!(tool_escape("edit", &args, &cwd, &[]).is_some());
+        assert!(tool_escape("edit", &args, &cwd, &[], &[]).is_some());
     }
 
     #[cfg(unix)]
@@ -746,7 +913,7 @@ mod tests {
             .as_object()
             .unwrap()
             .clone();
-        assert!(tool_escape("edit", &args, &cwd, &[]).is_some());
+        assert!(tool_escape("edit", &args, &cwd, &[], &[]).is_some());
     }
 
     #[cfg(unix)]
@@ -761,7 +928,7 @@ mod tests {
             .as_object()
             .unwrap()
             .clone();
-        assert!(tool_escape("edit", &args, &cwd, &[]).is_some());
+        assert!(tool_escape("edit", &args, &cwd, &[], &[]).is_some());
     }
 
     #[cfg(unix)]
@@ -778,7 +945,7 @@ mod tests {
             .as_object()
             .unwrap()
             .clone();
-        assert!(tool_escape("write", &args, &cwd, &[session]).is_none());
+        assert!(tool_escape("write", &args, &cwd, &[session], &[]).is_none());
     }
 
     #[test]
@@ -793,7 +960,7 @@ mod tests {
         .as_object()
         .unwrap()
         .clone();
-        assert!(tool_escape("shell", &args, &cwd, &[]).is_some());
+        assert!(tool_escape("shell", &args, &cwd, &[], &[]).is_some());
     }
 
     #[test]
@@ -858,17 +1025,17 @@ mod tests {
             .as_object()
             .unwrap()
             .clone();
-        assert!(tool_escape("edit", &args, &cwd, &[]).is_some());
+        assert!(tool_escape("edit", &args, &cwd, &[], &[]).is_some());
         let args = serde_json::json!({"targetDirectory": outside.display().to_string()})
             .as_object()
             .unwrap()
             .clone();
-        assert!(tool_escape("write", &args, &cwd, &[]).is_some());
+        assert!(tool_escape("write", &args, &cwd, &[], &[]).is_some());
         let args = serde_json::json!({"arguments": {"path": outside_file.display().to_string()}})
             .as_object()
             .unwrap()
             .clone();
-        assert!(tool_escape("edit", &args, &cwd, &[]).is_some());
+        assert!(tool_escape("edit", &args, &cwd, &[], &[]).is_some());
         fs::write(cwd.join("inside.txt"), b"i").unwrap();
         let args = serde_json::json!({
             "path": "inside.txt",
@@ -877,7 +1044,7 @@ mod tests {
         .as_object()
         .unwrap()
         .clone();
-        assert!(tool_escape("edit", &args, &cwd, &[]).is_some());
+        assert!(tool_escape("edit", &args, &cwd, &[], &[]).is_some());
     }
 
     #[test]
@@ -934,5 +1101,151 @@ mod tests {
             .expect("touch");
         let after = snapshot(&[dir.clone()], &["tracked.txt".into()], &dir);
         assert!(changed(&before, &after).is_empty());
+    }
+
+    fn shell_args(command: &str) -> serde_json::Map<String, Value> {
+        serde_json::json!({"command": command})
+            .as_object()
+            .unwrap()
+            .clone()
+    }
+
+    fn shell_hit(command: &str, cwd: &Path, protected: &[PathBuf]) -> Option<PathBuf> {
+        tool_escape("shell", &shell_args(command), cwd, &[], protected)
+    }
+
+    #[test]
+    fn shell_command_cp_into_protected_root() {
+        let cwd = unique_temp("shell-cp-cwd");
+        let main = unique_temp("shell-cp-main");
+        fs::create_dir_all(main.join("crates/foo/src")).unwrap();
+        let src = cwd.join("a.rs");
+        fs::write(&src, b"x").unwrap();
+        let cmd = format!(
+            "cp {} {}",
+            src.display(),
+            main.join("crates/foo/src/dde_lparam.rs").display()
+        );
+        assert!(shell_hit(&cmd, &cwd, &[main.clone()]).is_some());
+    }
+
+    #[test]
+    fn shell_command_cd_into_protected_root() {
+        let cwd = unique_temp("shell-cd-cwd");
+        let main = unique_temp("shell-cd-main");
+        fs::create_dir_all(&main).unwrap();
+        let cmd = format!("cd {} && cargo test", main.display());
+        assert!(shell_hit(&cmd, &cwd, &[main]).is_some());
+    }
+
+    #[test]
+    fn shell_command_git_checkout_in_protected_root() {
+        let cwd = unique_temp("shell-git-cwd");
+        let main = unique_temp("shell-git-main");
+        fs::create_dir_all(main.join("crates/ffi")).unwrap();
+        let cmd = format!(
+            "cd {} && git checkout -- crates/ffi/ffi.rs",
+            main.display()
+        );
+        assert!(shell_hit(&cmd, &cwd, &[main]).is_some());
+    }
+
+    #[test]
+    fn shell_command_cargo_target_dir_env() {
+        let cwd = unique_temp("shell-cargo-cwd");
+        let main = unique_temp("shell-cargo-main");
+        fs::create_dir_all(main.join("target")).unwrap();
+        let cmd = format!("CARGO_TARGET_DIR={}/target cargo test", main.display());
+        assert!(shell_hit(&cmd, &cwd, &[main]).is_some());
+    }
+
+    #[test]
+    fn shell_command_manifest_path_flag() {
+        let cwd = unique_temp("shell-manifest-cwd");
+        let main = unique_temp("shell-manifest-main");
+        fs::write(main.join("Cargo.toml"), b"[package]\nname=\"x\"\n").unwrap();
+        let cmd = format!("cargo test --manifest-path={}/Cargo.toml", main.display());
+        assert!(shell_hit(&cmd, &cwd, &[main]).is_some());
+    }
+
+    #[test]
+    fn shell_command_home_spelling_variants() {
+        let home = PathBuf::from(std::env::var("HOME").expect("HOME"));
+        let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let main = home.join(format!("cursor-seat-shell-home-main-{}-{n}", std::process::id()));
+        let _ = fs::remove_dir_all(&main);
+        fs::create_dir_all(&main).unwrap();
+        let cwd = unique_temp("shell-home-cwd");
+        let rel = main.strip_prefix(&home).expect("under home");
+        for cmd in [
+            format!("cat ~/{}/secret", rel.to_string_lossy()),
+            format!("cat $HOME/{}/secret", rel.to_string_lossy()),
+            format!("cat ${{HOME}}/{}/secret", rel.to_string_lossy()),
+        ] {
+            assert!(shell_hit(&cmd, &cwd, &[main.clone()]).is_some());
+        }
+    }
+
+    #[test]
+    fn shell_command_quoted_absolute_path() {
+        let cwd = unique_temp("shell-quote-cwd");
+        let main = unique_temp("shell-quote-main");
+        fs::create_dir_all(&main).unwrap();
+        let cmd = format!("cat '{}'", main.join("x.txt").display());
+        assert!(shell_hit(&cmd, &cwd, &[main]).is_some());
+    }
+
+    #[test]
+    fn shell_command_bash_lc_nested() {
+        let cwd = unique_temp("shell-bash-cwd");
+        let main = unique_temp("shell-bash-main");
+        fs::create_dir_all(&main).unwrap();
+        let inner = format!("cd {} && touch t", main.display());
+        let cmd = format!("bash -lc '{}'", inner);
+        assert!(shell_hit(&cmd, &cwd, &[main]).is_some());
+    }
+
+    #[test]
+    fn shell_command_allows_tmp_and_nix() {
+        let cwd = unique_temp("shell-ok-cwd");
+        let main = unique_temp("shell-ok-main");
+        assert!(shell_hit("cat /tmp/foo", &cwd, &[main.clone()]).is_none());
+        assert!(shell_hit("ls /nix/store/abc", &cwd, &[main]).is_none());
+    }
+
+    #[test]
+    fn shell_command_prefix_not_string_substring() {
+        let cwd = unique_temp("shell-prefix-cwd");
+        let root = unique_temp("shell-prefix-root");
+        let sibling = unique_temp("shell-prefix-sibling");
+        let name = root.file_name().unwrap().to_string_lossy();
+        let docs = sibling.parent().unwrap().join(format!("{name}-docs"));
+        let _ = fs::remove_dir_all(&docs);
+        fs::create_dir_all(&docs).unwrap();
+        let cmd = format!("cat {}/x", docs.display());
+        assert!(shell_hit(&cmd, &cwd, &[root]).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_command_ignores_relative_symlink_into_root() {
+        use std::os::unix::fs::symlink;
+        let cwd = unique_temp("shell-rel-cwd");
+        let main = unique_temp("shell-rel-main");
+        fs::create_dir_all(&main).unwrap();
+        symlink(&main, cwd.join("sdk")).unwrap();
+        assert!(shell_hit("cat sdk/secret.txt", &cwd, &[main]).is_none());
+    }
+
+    #[test]
+    fn shell_command_path_under_cwd_sibling_of_root() {
+        let parent = unique_temp("shell-sib-parent");
+        let main = parent.join("main");
+        let wt = parent.join("wt");
+        fs::create_dir_all(&main).unwrap();
+        fs::create_dir_all(&wt).unwrap();
+        fs::write(wt.join("ok.txt"), b"ok").unwrap();
+        let cmd = format!("cat {}/ok.txt", wt.display());
+        assert!(shell_hit(&cmd, &wt, &[main]).is_none());
     }
 }

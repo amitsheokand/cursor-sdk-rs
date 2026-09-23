@@ -399,6 +399,9 @@ pub async fn run_seat(
             cwd: cwd.clone(),
             allowed_extra: allowed_extra.clone(),
             guard_tools,
+            protected_roots: protected_roots.clone(),
+            fence_entries: request.fence.clone(),
+            protected_baseline: protected_before.clone(),
         },
     )
     .await;
@@ -503,6 +506,9 @@ pub async fn run_seat(
                                         cwd: cwd.clone(),
                                         allowed_extra: allowed_extra.clone(),
                                         guard_tools,
+                                        protected_roots: protected_roots.clone(),
+                                        fence_entries: request.fence.clone(),
+                                        protected_baseline: protected_before.clone(),
                                     },
                                 )
                                 .await;
@@ -890,6 +896,9 @@ async fn attach(
                     cwd: cwd.clone(),
                     allowed_extra: allowed_extra.clone(),
                     guard_tools,
+                    protected_roots: protected_roots.clone(),
+                    fence_entries: request.fence.clone(),
+                    protected_baseline: protected_before.clone(),
                 },
             )
             .await;
@@ -942,6 +951,9 @@ struct DriveFence {
     cwd: PathBuf,
     allowed_extra: Vec<PathBuf>,
     guard_tools: bool,
+    protected_roots: Vec<PathBuf>,
+    fence_entries: Vec<String>,
+    protected_baseline: Option<Digest>,
 }
 
 /// Flags the drive loop hands back for post-turn decisions.
@@ -1009,23 +1021,43 @@ async fn drive(
                     Some(Ok(RunEvent::Message(message))) => {
                         observe_ids(handles, message.run_id(), &mut state, session, emit).await;
                         if fence.guard_tools {
-                            if let Some(path) = tool_fence_hit(&message, &fence.cwd, &fence.allowed_extra) {
+                            if let Some(path) = tool_fence_hit(
+                                &message,
+                                &fence.cwd,
+                                &fence.allowed_extra,
+                                &fence.protected_roots,
+                            ) {
                                 let tool = tool_label(&message);
-                                emit(SeatEventKind::Fence {
-                                    kind: "escape".to_string(),
-                                    path: path.display().to_string(),
-                                    tool,
-                                });
-                                state.fence_escape = Some(path.display().to_string());
-                                state.pending_cancel = true;
-                                if state.run_id.is_some() {
-                                    record(session, |store| store.set_state(OpState::Canceling));
-                                    handles
-                                        .cancel_run(state.run_id.as_deref().unwrap_or_default())
-                                        .await;
-                                }
+                                emit_fence_escape(
+                                    &path,
+                                    &tool,
+                                    &mut state,
+                                    handles,
+                                    session,
+                                    emit,
+                                )
+                                .await;
                             } else {
+                                let is_tool_call = message.kind.as_str() == "tool_call";
                                 emit_message(message, &mut state, emit);
+                                if is_tool_call {
+                                    let now = Instant::now();
+                                    let due = state
+                                        .last_protected_snapshot
+                                        .map(|t| now.duration_since(t) >= Duration::from_secs(1))
+                                        .unwrap_or(true);
+                                    if due {
+                                        state.last_protected_snapshot = Some(now);
+                                        protected_snapshot_escape(
+                                            &fence,
+                                            &mut state,
+                                            handles,
+                                            session,
+                                            emit,
+                                        )
+                                        .await;
+                                    }
+                                }
                             }
                         } else {
                             emit_message(message, &mut state, emit);
@@ -1080,6 +1112,9 @@ async fn drive(
                     emit(SeatEventKind::Heartbeat {});
                     last_activity = Instant::now();
                 }
+                if fence.guard_tools {
+                    protected_snapshot_escape(&fence, &mut state, handles, session, emit).await;
+                }
             }
             _ = tokio::time::sleep_until(deadline.into()) => {
                 let _ = run.cancel().await;
@@ -1130,6 +1165,7 @@ struct DriveState {
     resumed: bool,
     resumptions: u32,
     fence_escape: Option<String>,
+    last_protected_snapshot: Option<Instant>,
 }
 
 /// Record run/agent ids; on first sight emit `run_started` and fire a
@@ -1295,6 +1331,9 @@ async fn apply_post_drive_fence(
                             cwd: cwd.to_path_buf(),
                             allowed_extra: allowed_extra.to_vec(),
                             guard_tools,
+                            protected_roots: protected_roots.to_vec(),
+                            fence_entries: request.fence.clone(),
+                            protected_baseline: protected_before.cloned(),
                         },
                     )
                     .await;
@@ -1336,12 +1375,59 @@ fn tool_fence_hit(
     message: &StreamMessage,
     cwd: &Path,
     allowed_extra: &[PathBuf],
+    protected_roots: &[PathBuf],
 ) -> Option<PathBuf> {
     if message.kind.as_str() != "tool_call" {
         return None;
     }
     let (name, args) = crate::fence::tool_args_from_message(message);
-    crate::fence::tool_escape(&name, &args, cwd, allowed_extra)
+    crate::fence::tool_escape(&name, &args, cwd, allowed_extra, protected_roots)
+}
+
+async fn emit_fence_escape(
+    path: &Path,
+    tool: &str,
+    state: &mut DriveState,
+    handles: &Handles<'_>,
+    session: &mut Option<SessionStore>,
+    emit: &mut dyn FnMut(SeatEventKind),
+) {
+    emit(SeatEventKind::Fence {
+        kind: "escape".to_string(),
+        path: path.display().to_string(),
+        tool: tool.to_string(),
+    });
+    state.fence_escape = Some(path.display().to_string());
+    state.pending_cancel = true;
+    if state.run_id.is_some() {
+        record(session, |store| store.set_state(OpState::Canceling));
+        handles
+            .cancel_run(state.run_id.as_deref().unwrap_or_default())
+            .await;
+    }
+}
+
+async fn protected_snapshot_escape(
+    fence: &DriveFence,
+    state: &mut DriveState,
+    handles: &Handles<'_>,
+    session: &mut Option<SessionStore>,
+    emit: &mut dyn FnMut(SeatEventKind),
+) {
+    if fence.protected_roots.is_empty() {
+        return;
+    }
+    let Some(before) = fence.protected_baseline.as_ref() else {
+        return;
+    };
+    let after =
+        snapshot_async(&fence.protected_roots, &fence.fence_entries, &fence.cwd).await;
+    let paths = changed(before, &after);
+    if paths.is_empty() {
+        return;
+    }
+    let path = paths[0].clone();
+    emit_fence_escape(&path, "", state, handles, session, emit).await;
 }
 
 fn fence_escape_result(

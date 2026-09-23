@@ -76,8 +76,17 @@ run failures arrives in P4. Controls arriving after the result are moot
   `verdict` is the Choice/Noul outcome; `p` its probability)
 - `fence {kind, path, tool}` (`kind` is `escape` or `drift`; `path` is the
   offending path; `tool` is the tool name when applicable)
-- Live escape checks inspect tool path/`cwd` arguments only; the seat does
-  not parse shell command strings (protected-root snapshots are the backstop).
+- Live escape checks inspect tool path/`cwd` arguments. For shell tools, the
+  seat also tokenizes the command string (`command` / `cmd` / `script`, including
+  nested `arguments`) on whitespace and shell metacharacters, and treats
+  absolute or home-relative tokens (and `KEY=value` / `--flag=value` path
+  suffixes) as path candidates. A candidate escapes when it lies under a
+  `protected_root` and is not under `cwd` or `session_dir` (lexical token
+  normalization only — no symlink follow on command tokens).
+- During the drive loop, protected-root snapshots are re-run after each
+  `tool_call` (debounced to at most once per second) and on every heartbeat
+  tick; any change from the pre-run baseline emits `fence` `escape` and
+  cancels the run. The post-drive snapshot remains as a backstop.
 - final `result`
 
 `result`: `outcome: ok|failed|startup_error|busy|bounced|stale`,

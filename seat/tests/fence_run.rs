@@ -186,6 +186,61 @@ async fn edit_outside_cwd_bounces_and_cancels() {
 }
 
 #[tokio::test]
+async fn shell_command_into_protected_root_bounces_and_cancels() {
+    let cwd = workspace_dir();
+    let protected = workspace_dir();
+    fs::create_dir_all(protected.join("crates")).unwrap();
+    let bridge = FakeBridge::start().await;
+    script_models_create_close(&bridge);
+    let target = protected.join("crates/evil.rs");
+    bridge.expect(
+        "SdkAgentService/Send",
+        Reply::Stream(vec![
+            sdk_message_frame(
+                "system",
+                json!({"run_id": "run_1", "agent_id": "agent_1"}),
+                Some("o1"),
+            ),
+            sdk_message_frame(
+                "tool_call",
+                json!({
+                    "name": "shell",
+                    "args": {
+                        "cwd": cwd.display().to_string(),
+                        "command": format!("cp /dev/null {}", target.display()),
+                    },
+                    "status": "started",
+                    "call_id": "c1",
+                }),
+                Some("o2"),
+            ),
+            result_frame(
+                "agent_1",
+                "run_1",
+                proto::RunLifecycleStatus::Cancelled,
+                "",
+            ),
+            done_frame("agent_1", "run_1"),
+        ]),
+    );
+    bridge.always(
+        "SdkAgentService/CancelRun",
+        Reply::unary(&proto::CancelRunResponse {}),
+    );
+
+    let req = fenced_request(
+        cwd,
+        vec!["crates".into()],
+        vec![protected.to_string_lossy().into_owned()],
+    );
+    let (_, result) = collect(&bridge, req).await;
+
+    assert_eq!(bridge.call_count("SdkAgentService/CancelRun"), 1);
+    assert_eq!(result.outcome, Outcome::Bounced);
+    assert_eq!(result.error_kind.as_deref(), Some("FenceEscape"));
+}
+
+#[tokio::test]
 async fn shell_cwd_outside_bounces_and_cancels() {
     let cwd = workspace_dir();
     let outside = workspace_dir();
@@ -270,6 +325,93 @@ async fn read_outside_cwd_is_allowed() {
 
     assert_eq!(result.outcome, Outcome::Ok);
     assert_eq!(bridge.call_count("SdkAgentService/CancelRun"), 0);
+}
+
+#[tokio::test]
+async fn protected_root_midrun_escape_after_tool_call() {
+    let cwd = workspace_dir();
+    let protected = workspace_dir();
+    let tracked = protected.join("mirror.txt");
+    fs::write(&tracked, b"before").unwrap();
+
+    let bridge = FakeBridge::start().await;
+    script_models_create_close(&bridge);
+    let mut stream_frames = vec![
+        sdk_message_frame(
+            "system",
+            json!({"run_id": "run_1", "agent_id": "agent_1"}),
+            Some("o1"),
+        ),
+        sdk_message_frame(
+            "tool_call",
+            json!({
+                "name": "read",
+                "args": {"path": cwd.join("in.txt").display().to_string()},
+                "status": "completed",
+                "call_id": "c1",
+            }),
+            Some("o2"),
+        ),
+    ];
+    stream_frames.extend((0..64).map(|_| keepalive_frame()));
+    stream_frames.push(
+        result_frame(
+            "agent_1",
+            "run_1",
+            proto::RunLifecycleStatus::Cancelled,
+            "",
+        ),
+    );
+    stream_frames.push(done_frame("agent_1", "run_1"));
+    bridge.expect("SdkAgentService/Send", Reply::Stream(stream_frames));
+    bridge.always(
+        "SdkAgentService/CancelRun",
+        Reply::unary(&proto::CancelRunResponse {}),
+    );
+
+    let mut req = fenced_request(
+        cwd.clone(),
+        vec!["mirror.txt".into()],
+        vec![protected.to_string_lossy().into_owned()],
+    );
+    req.limits.heartbeat_s = 1;
+    fs::write(cwd.join("in.txt"), b"ok").unwrap();
+
+    let tracked_mut = tracked.clone();
+    let client = client_for(&bridge);
+    let inbox = Inbox::new(&[]).unwrap();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let run_fut = run_seat(&client, req, inbox, tx, None);
+    tokio::pin!(run_fut);
+    let mut result = None;
+    let mut saw_tool = false;
+    loop {
+        tokio::select! {
+            outcome = &mut run_fut, if result.is_none() => {
+                result = Some(outcome);
+            }
+            event = rx.recv() => match event {
+                Some(event) => {
+                    if matches!(&event.kind, SeatEventKind::ToolCall { .. }) {
+                        saw_tool = true;
+                        fs::write(&tracked_mut, b"after").unwrap();
+                    }
+                    if let SeatEventKind::Result(r) = event.kind {
+                        result = Some(r);
+                    }
+                }
+                None => break,
+            },
+        }
+        if result.is_some() {
+            break;
+        }
+    }
+    let result = result.expect("result");
+    assert!(saw_tool);
+    assert_eq!(result.outcome, Outcome::Bounced);
+    assert_eq!(result.error_kind.as_deref(), Some("FenceEscape"));
+    assert_eq!(bridge.call_count("SdkAgentService/CancelRun"), 1);
 }
 
 #[tokio::test]
