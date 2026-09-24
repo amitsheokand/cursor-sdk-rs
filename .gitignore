@@ -2,4 +2,5 @@
 /debug
 Cargo.lock
 .DS_Store
-.env
+.envresult
+result-*
