@@ -56,8 +56,8 @@ async fn run() -> Result<bool, Fatal> {
             "missing SeatRequest on stdin line 1".to_string(),
         ));
     }
-    let mut request: SeatRequest =
-        serde_json::from_str(&first).map_err(|e| Fatal::Failed(format!("invalid SeatRequest: {e}")))?;
+    let mut request: SeatRequest = serde_json::from_str(&first)
+        .map_err(|e| Fatal::Failed(format!("invalid SeatRequest: {e}")))?;
     request.validate().map_err(Fatal::Failed)?;
 
     let client = cursor_sdk::Client::builder()
@@ -67,9 +67,8 @@ async fn run() -> Result<bool, Fatal> {
     // broken log fails closed before any bridge contact.
     let session = match request.session_dir.as_deref() {
         Some(dir) => {
-            let (store, _) =
-                SessionStore::open(std::path::Path::new(dir), &request.request_id)
-                    .map_err(|e| Fatal::Failed(format!("invalid session: {e}")))?;
+            let (store, _) = SessionStore::open(std::path::Path::new(dir), &request.request_id)
+                .map_err(|e| Fatal::Failed(format!("invalid session: {e}")))?;
             Some(store)
         }
         None => None,
@@ -116,7 +115,10 @@ async fn run() -> Result<bool, Fatal> {
                 .await
                 .map_err(|e| format!("failed to write event: {e}"))?;
         }
-        stdout.flush().await.map_err(|e| format!("flush failed: {e}"))?;
+        stdout
+            .flush()
+            .await
+            .map_err(|e| format!("flush failed: {e}"))?;
         Ok::<(), String>(())
     });
 

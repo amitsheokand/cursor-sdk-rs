@@ -41,35 +41,52 @@ pub struct ToolgateContext {
     pub cwd: PathBuf,
     pub fence: Vec<String>,
     pub gates: Vec<String>,
+    pub allowed_extra: Vec<PathBuf>,
+    pub protected_roots: Vec<PathBuf>,
 }
 
 impl ToolgateContext {
     pub fn from_request(request: &SeatRequest) -> Self {
+        let allowed_extra = request
+            .session_dir
+            .as_deref()
+            .map(PathBuf::from)
+            .into_iter()
+            .collect();
         Self {
             cwd: PathBuf::from(&request.cwd),
             fence: request.fence.clone(),
             gates: request.toolgate.gates.clone(),
+            allowed_extra,
+            protected_roots: request.protected_roots.iter().map(PathBuf::from).collect(),
         }
     }
 }
 
 /// Apply `replace` disallowed built-ins before agent options are built.
-pub fn apply_replace_disallowed(request: &mut SeatRequest) {
+/// Returns the tool names this call appended (for selective revert on SDK rejection).
+pub fn apply_replace_disallowed(request: &mut SeatRequest) -> Vec<String> {
     if !request.toolgate.mode.is_replace() {
-        return;
+        return Vec::new();
     }
+    let mut added = Vec::new();
     for name in BUILTIN_REPLACE {
         if !request.disallowed_tools.iter().any(|t| t == name) {
             request.disallowed_tools.push((*name).to_string());
+            added.push((*name).to_string());
         }
     }
+    added
 }
 
-/// Undo [`apply_replace_disallowed`] when the SDK rejects a disallowed name.
-pub fn revert_replace_disallowed(request: &mut SeatRequest) {
+/// Undo only the entries [`apply_replace_disallowed`] added on this attempt.
+pub fn revert_replace_disallowed(request: &mut SeatRequest, added: &[String]) {
+    if added.is_empty() {
+        return;
+    }
     request
         .disallowed_tools
-        .retain(|name| !BUILTIN_REPLACE.iter().any(|b| b == name));
+        .retain(|name| !added.iter().any(|a| a == name));
 }
 
 /// Register toolgate tools when `mode` is `add` or `replace`.
@@ -189,7 +206,7 @@ pub fn invoke_tool_sync(ctx: &ToolgateContext, name: &str, args: Value) -> Value
     let work = match name {
         TOOL_READ_WINDOW => read_window(root, &map),
         TOOL_EDIT_DIFF => edit_diff(root, &ctx.fence, &map),
-        TOOL_RUN_BOUNDED => run_bounded(root, &map),
+        TOOL_RUN_BOUNDED => run_bounded(ctx, &map),
         TOOL_RUN_GATES => run_gates(root, &ctx.gates),
         other => Err(format!("unknown toolgate tool: {other}")),
     };
@@ -243,7 +260,17 @@ fn edit_diff(root: &Path, fence: &[String], args: &Map<String, Value>) -> Result
     Ok(serde_json::to_value(hit).unwrap_or(json!({})))
 }
 
-fn run_bounded(root: &Path, args: &Map<String, Value>) -> Result<Value, String> {
+fn run_bounded(ctx: &ToolgateContext, args: &Map<String, Value>) -> Result<Value, String> {
+    let root = ctx.cwd.as_path();
+    if let Some(hit) = crate::fence::tool_escape(
+        TOOL_RUN_BOUNDED,
+        args,
+        root,
+        &ctx.allowed_extra,
+        &ctx.protected_roots,
+    ) {
+        return Err(format!("command escapes protected root: {}", hit.display()));
+    }
     let program = require_str(args, "program")?;
     let argv = optional_string_list(args, "args");
     let timeout = optional_u64(args, "timeout").unwrap_or(DEFAULT_TIMEOUT_SECS);
@@ -341,6 +368,8 @@ mod tests {
             cwd: dir.to_path_buf(),
             fence: vec!["allowed.txt".into()],
             gates: vec!["true".into(), "false".into()],
+            allowed_extra: vec![],
+            protected_roots: vec![],
         }
     }
 
@@ -355,6 +384,52 @@ mod tests {
         assert_eq!(gates.len(), 2);
         assert_eq!(gates[0]["exit"], 0);
         assert_eq!(gates[1]["exit"], 1);
+    }
+
+    #[test]
+    fn revert_replace_only_removes_names_this_attempt_added() {
+        let mut req = SeatRequest {
+            v: 1,
+            request_id: "t".into(),
+            cwd: std::env::temp_dir().to_string_lossy().into_owned(),
+            model: crate::protocol::ModelRef {
+                id: "m".into(),
+                params: crate::protocol::ModelParams {
+                    effort: None,
+                    extra: Default::default(),
+                },
+            },
+            prompt: crate::protocol::PromptPart {
+                task: "t".into(),
+                effort_tag: "e".into(),
+                body: "b".into(),
+                steer: None,
+            },
+            mcp_servers: vec![],
+            disallowed_tools: vec!["task".into(), "read".into()],
+            tools_enabled: vec![],
+            skill_roots: vec![],
+            jev: Default::default(),
+            toolgate: crate::protocol::ToolgateConfig {
+                mode: crate::protocol::ToolgateMode::Replace,
+                gates: vec![],
+            },
+            limits: crate::protocol::Limits {
+                context_chars: 1,
+                clip_chars: 1,
+                timeout_s: 1,
+                heartbeat_s: 1,
+            },
+            session_dir: None,
+            fence: vec![],
+            protected_roots: vec![],
+        };
+        let added = apply_replace_disallowed(&mut req);
+        assert!(added.iter().any(|n| n == "shell"));
+        assert!(!added.iter().any(|n| n == "read"));
+        revert_replace_disallowed(&mut req, &added);
+        assert!(req.disallowed_tools.iter().any(|t| t == "read"));
+        assert!(!req.disallowed_tools.iter().any(|t| t == "shell"));
     }
 
     #[tokio::test]

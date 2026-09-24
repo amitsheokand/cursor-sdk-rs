@@ -22,9 +22,15 @@ async fn main() {
 
 async fn run() -> Result<(), String> {
     let mut args = std::env::args().skip(1);
-    let cwd = args.next().ok_or("usage: bench <cwd> <model> <fast> <prompt>")?;
-    let model = args.next().ok_or("usage: bench <cwd> <model> <fast> <prompt>")?;
-    let fast = args.next().ok_or("usage: bench <cwd> <model> <fast> <prompt>")?;
+    let cwd = args
+        .next()
+        .ok_or("usage: bench <cwd> <model> <fast> <prompt>")?;
+    let model = args
+        .next()
+        .ok_or("usage: bench <cwd> <model> <fast> <prompt>")?;
+    let fast = args
+        .next()
+        .ok_or("usage: bench <cwd> <model> <fast> <prompt>")?;
     let prompt: Vec<String> = args.collect();
     if prompt.is_empty() {
         return Err("usage: bench <cwd> <model> <fast> <prompt>".to_string());

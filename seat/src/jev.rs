@@ -146,7 +146,11 @@ fn parse_key_file(path: &Path, var: &str) -> Result<String, JevError> {
         let Some((name, value)) = line.split_once('=') else {
             continue;
         };
-        let name = name.trim().strip_prefix("export ").unwrap_or(name.trim()).trim();
+        let name = name
+            .trim()
+            .strip_prefix("export ")
+            .unwrap_or(name.trim())
+            .trim();
         if name == var {
             let value = value.trim().trim_matches('"').trim_matches('\'');
             if value.is_empty() {
@@ -216,7 +220,8 @@ pub fn load_questions(dir: &Path) -> Result<QuestionSet, JevError> {
     let entries = std::fs::read_dir(dir)
         .map_err(|e| JevError::Config(format!("cannot list {}: {e}", dir.display())))?;
     for entry in entries {
-        let entry = entry.map_err(|e| JevError::Config(format!("cannot list {}: {e}", dir.display())))?;
+        let entry =
+            entry.map_err(|e| JevError::Config(format!("cannot list {}: {e}", dir.display())))?;
         let path = entry.path();
         if path.extension().and_then(|ext| ext.to_str()) == Some("toml") {
             files.push(path);
@@ -263,7 +268,8 @@ fn merge_toml_file(set: &mut QuestionSet, path: &Path) -> Result<(), JevError> {
                             path.display()
                         )));
                     }
-                    set.questions.insert(id.clone(), parse_question(id, raw, path)?);
+                    set.questions
+                        .insert(id.clone(), parse_question(id, raw, path)?);
                 }
             }
             "thresholds" => {
@@ -277,12 +283,15 @@ fn merge_toml_file(set: &mut QuestionSet, path: &Path) -> Result<(), JevError> {
                             path.display()
                         )));
                     }
-                    let number = value.as_float().or_else(|| value.as_integer().map(|v| v as f64)).ok_or_else(|| {
-                        JevError::Config(format!(
-                            "threshold `{key}` is not a number in {}",
-                            path.display()
-                        ))
-                    })?;
+                    let number = value
+                        .as_float()
+                        .or_else(|| value.as_integer().map(|v| v as f64))
+                        .ok_or_else(|| {
+                            JevError::Config(format!(
+                                "threshold `{key}` is not a number in {}",
+                                path.display()
+                            ))
+                        })?;
                     set.thresholds.insert(key.clone(), number);
                 }
             }
@@ -298,7 +307,8 @@ fn merge_toml_file(set: &mut QuestionSet, path: &Path) -> Result<(), JevError> {
 }
 
 fn parse_question(id: &str, raw: &toml::Value, path: &Path) -> Result<Question, JevError> {
-    let fail = |reason: &str| JevError::Config(format!("question `{id}` in {}: {reason}", path.display()));
+    let fail =
+        |reason: &str| JevError::Config(format!("question `{id}` in {}: {reason}", path.display()));
     let table = raw.as_table().ok_or_else(|| fail("not a table"))?;
     let qtype = match table.get("type").and_then(|v| v.as_str()) {
         Some("choice") => QuestionType::Choice,
@@ -315,9 +325,13 @@ fn parse_question(id: &str, raw: &toml::Value, path: &Path) -> Result<Question, 
         QuestionType::Choice => {
             let mut map: BTreeMap<String, Option<String>> = BTreeMap::new();
             if let Some(options) = table.get("options") {
-                let options = options.as_array().ok_or_else(|| fail("options must be an array"))?;
+                let options = options
+                    .as_array()
+                    .ok_or_else(|| fail("options must be an array"))?;
                 for option in options {
-                    let text = option.as_str().ok_or_else(|| fail("option must be a string"))?;
+                    let text = option
+                        .as_str()
+                        .ok_or_else(|| fail("option must be a string"))?;
                     map.insert(option_key(text), Some(text.to_string()));
                 }
             }
@@ -337,21 +351,35 @@ fn parse_question(id: &str, raw: &toml::Value, path: &Path) -> Result<Question, 
             Criteria::Map(map)
         }
         QuestionType::Noul => {
-            let yes = table.get("criteria_true").and_then(|v| v.as_str()).ok_or_else(|| fail("missing criteria_true"))?;
-            let no = table.get("criteria_false").and_then(|v| v.as_str()).ok_or_else(|| fail("missing criteria_false"))?;
+            let yes = table
+                .get("criteria_true")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| fail("missing criteria_true"))?;
+            let no = table
+                .get("criteria_false")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| fail("missing criteria_false"))?;
             Criteria::Map(BTreeMap::from([
                 ("true".to_string(), Some(yes.to_string())),
                 ("false".to_string(), Some(no.to_string())),
             ]))
         }
         QuestionType::Score => {
-            let levels = table.get("levels").and_then(|v| v.as_array()).ok_or_else(|| fail("missing levels array"))?;
+            let levels = table
+                .get("levels")
+                .and_then(|v| v.as_array())
+                .ok_or_else(|| fail("missing levels array"))?;
             if levels.len() < 2 {
                 return Err(fail("score needs at least two levels"));
             }
             let mut out = Vec::with_capacity(levels.len());
             for level in levels {
-                out.push(level.as_str().ok_or_else(|| fail("level must be a string"))?.to_string());
+                out.push(
+                    level
+                        .as_str()
+                        .ok_or_else(|| fail("level must be a string"))?
+                        .to_string(),
+                );
             }
             Criteria::List(out)
         }
@@ -365,7 +393,12 @@ fn parse_question(id: &str, raw: &toml::Value, path: &Path) -> Result<Question, 
 
 /// triage.toml convention: the key is the text before the first colon.
 fn option_key(option: &str) -> String {
-    option.split(':').next().unwrap_or(option).trim().to_string()
+    option
+        .split(':')
+        .next()
+        .unwrap_or(option)
+        .trim()
+        .to_string()
 }
 
 // ---- client ------------------------------------------------------------------
@@ -380,12 +413,17 @@ pub struct JevClient {
 
 impl JevClient {
     pub fn new(key: ApiKey) -> Result<Self, JevError> {
-        let endpoint = std::env::var("TYPESAFE_ENDPOINT").unwrap_or_else(|_| SYSTEM_ONE_URL.to_string());
+        let endpoint =
+            std::env::var("TYPESAFE_ENDPOINT").unwrap_or_else(|_| SYSTEM_ONE_URL.to_string());
         let http = reqwest::Client::builder()
             .timeout(JEV_TIMEOUT)
             .build()
             .map_err(|e| JevError::Transport(e.to_string()))?;
-        Ok(JevClient { http, key, endpoint })
+        Ok(JevClient {
+            http,
+            key,
+            endpoint,
+        })
     }
 
     pub fn endpoint(&self) -> &str {
@@ -418,12 +456,19 @@ impl JevClient {
             .json()
             .await
             .map_err(|_| JevError::Protocol("malformed JSON".to_string()))?;
-        let answers = parsed.get("answers").ok_or_else(|| JevError::Protocol("missing answers".to_string()))?;
-        let map = answers.as_object().ok_or_else(|| JevError::Protocol("answers is not an object".to_string()))?;
+        let answers = parsed
+            .get("answers")
+            .ok_or_else(|| JevError::Protocol("missing answers".to_string()))?;
+        let map = answers
+            .as_object()
+            .ok_or_else(|| JevError::Protocol("answers is not an object".to_string()))?;
         if map.is_empty() {
             return Err(JevError::Protocol("missing answers".to_string()));
         }
-        Ok(map.iter().map(|(key, value)| (key.clone(), value.clone())).collect())
+        Ok(map
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect())
     }
 }
 
@@ -443,7 +488,11 @@ fn number(value: Option<&serde_json::Value>) -> Result<f64, JevError> {
 
 pub fn parse_choice(answer: &serde_json::Value) -> Result<ChoiceAnswer, JevError> {
     let bad = || JevError::Protocol("invalid choice answer".to_string());
-    let choice = answer.get("choice").and_then(|v| v.as_str()).ok_or_else(bad)?.to_string();
+    let choice = answer
+        .get("choice")
+        .and_then(|v| v.as_str())
+        .ok_or_else(bad)?
+        .to_string();
     let probabilities = answer
         .get("probabilities")
         .and_then(|v| v.as_object())
@@ -465,7 +514,8 @@ pub fn parse_noul(answer: &serde_json::Value) -> Result<f64, JevError> {
 
 pub fn parse_score(answer: &serde_json::Value) -> Result<(f64, f64), JevError> {
     Ok((
-        number(answer.get("score")).map_err(|_| JevError::Protocol("invalid score answer".to_string()))?,
+        number(answer.get("score"))
+            .map_err(|_| JevError::Protocol("invalid score answer".to_string()))?,
         number(answer.get("confidence"))?,
     ))
 }
@@ -841,7 +891,11 @@ pub struct SelfCheckAnswer {
 /// Ask the `receipt_supported` Noul over the final text plus `git diff`.
 /// Missing question, non-Noul shape, or any Jev error fails closed as an
 /// error (the caller then skips the follow-up, keeping the result).
-pub async fn self_check(jev: &JevHandle, text: &str, diff: &str) -> Result<SelfCheckAnswer, JevError> {
+pub async fn self_check(
+    jev: &JevHandle,
+    text: &str,
+    diff: &str,
+) -> Result<SelfCheckAnswer, JevError> {
     let question = jev
         .questions
         .questions
@@ -853,10 +907,7 @@ pub async fn self_check(jev: &JevHandle, text: &str, diff: &str) -> Result<SelfC
         )));
     }
     let answer = jev
-        .ask(
-            CHECK_SELF,
-            &serde_json::json!({"text": text, "diff": diff}),
-        )
+        .ask(CHECK_SELF, &serde_json::json!({"text": text, "diff": diff}))
         .await?;
     let p = parse_noul(&answer)?;
     Ok(SelfCheckAnswer {
@@ -876,7 +927,11 @@ pub async fn triage(jev: &JevHandle, status: &str, text: &str) -> Result<(String
         )
         .await?;
     let answer = parse_choice(&answer)?;
-    let p = answer.probabilities.get(&answer.choice).copied().unwrap_or(0.0);
+    let p = answer
+        .probabilities
+        .get(&answer.choice)
+        .copied()
+        .unwrap_or(0.0);
     Ok((answer.choice, p))
 }
 
@@ -1072,8 +1127,14 @@ mod tests {
         let set = load_questions(&dir).unwrap();
         let api = set.questions["failure_class"].to_api_json();
         // Values keep the full option text (triage.py convention).
-        assert_eq!(api["criteria"]["code"], serde_json::json!("code: wrong impl."));
-        assert_eq!(api["criteria"]["flake"], serde_json::json!("flake: transient."));
+        assert_eq!(
+            api["criteria"]["code"],
+            serde_json::json!("code: wrong impl.")
+        );
+        assert_eq!(
+            api["criteria"]["flake"],
+            serde_json::json!("flake: transient.")
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1125,19 +1186,43 @@ mod tests {
     #[test]
     fn prune_decision_drops_only_clear_irrelevance() {
         let candidates = vec![
-            PruneCandidate { name: "keep".into(), description: String::new() },
-            PruneCandidate { name: "drop".into(), description: String::new() },
-            PruneCandidate { name: "shy".into(), description: String::new() },
-            PruneCandidate { name: "mute".into(), description: String::new() },
+            PruneCandidate {
+                name: "keep".into(),
+                description: String::new(),
+            },
+            PruneCandidate {
+                name: "drop".into(),
+                description: String::new(),
+            },
+            PruneCandidate {
+                name: "shy".into(),
+                description: String::new(),
+            },
+            PruneCandidate {
+                name: "mute".into(),
+                description: String::new(),
+            },
         ];
         let answers = BTreeMap::from([
-            ("tool:keep".to_string(), serde_json::json!({"type": "noul", "noul": 0.9})),
-            ("tool:drop".to_string(), serde_json::json!({"type": "noul", "noul": 0.1})),
-            ("tool:shy".to_string(), serde_json::json!({"type": "noul", "noul": 0.45})),
+            (
+                "tool:keep".to_string(),
+                serde_json::json!({"type": "noul", "noul": 0.9}),
+            ),
+            (
+                "tool:drop".to_string(),
+                serde_json::json!({"type": "noul", "noul": 0.1}),
+            ),
+            (
+                "tool:shy".to_string(),
+                serde_json::json!({"type": "noul", "noul": 0.45}),
+            ),
         ]);
         // mute has no answer: kept (fail-open). shy is uncertain: kept.
         let (kept, floor) = prune_decision(&candidates, &answers);
-        assert_eq!(kept, vec!["keep".to_string(), "shy".to_string(), "mute".to_string()]);
+        assert_eq!(
+            kept,
+            vec!["keep".to_string(), "shy".to_string(), "mute".to_string()]
+        );
         assert!((floor - 0.45).abs() < 1e-9);
     }
 
@@ -1225,12 +1310,27 @@ mod tests {
 
     #[test]
     fn screen_routing_thresholds() {
-        assert_eq!(route_screen(&BTreeMap::from([("a".to_string(), 0.1)]), 0.0), "pass");
-        assert_eq!(route_screen(&BTreeMap::from([("a".to_string(), 0.5)]), 0.0), "review");
-        assert_eq!(route_screen(&BTreeMap::from([("a".to_string(), 0.9)]), 0.0), "block");
+        assert_eq!(
+            route_screen(&BTreeMap::from([("a".to_string(), 0.1)]), 0.0),
+            "pass"
+        );
+        assert_eq!(
+            route_screen(&BTreeMap::from([("a".to_string(), 0.5)]), 0.0),
+            "review"
+        );
+        assert_eq!(
+            route_screen(&BTreeMap::from([("a".to_string(), 0.9)]), 0.0),
+            "block"
+        );
         // Severity upgrades a review, never downgrades a pass on its own.
-        assert_eq!(route_screen(&BTreeMap::from([("a".to_string(), 0.5)]), 2.5), "block");
-        assert_eq!(route_screen(&BTreeMap::from([("a".to_string(), 0.1)]), 2.5), "pass");
+        assert_eq!(
+            route_screen(&BTreeMap::from([("a".to_string(), 0.5)]), 2.5),
+            "block"
+        );
+        assert_eq!(
+            route_screen(&BTreeMap::from([("a".to_string(), 0.1)]), 2.5),
+            "pass"
+        );
     }
 
     #[tokio::test]
@@ -1254,7 +1354,10 @@ mod tests {
             skill_roots: vec![],
         };
         let stubbed = skill_use(&bare, &serde_json::json!({"skill": "deploy"})).await;
-        assert!(stubbed["error"].as_str().unwrap().contains("not configured"));
+        assert!(stubbed["error"]
+            .as_str()
+            .unwrap()
+            .contains("not configured"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1264,8 +1367,7 @@ mod tests {
             jev: None,
             skill_roots: vec![],
         };
-        let answer =
-            jev_verify(&tools, &serde_json::json!({"claim": "c", "section": "s"})).await;
+        let answer = jev_verify(&tools, &serde_json::json!({"claim": "c", "section": "s"})).await;
         let error = answer.get("error").and_then(|e| e.as_str()).unwrap_or("");
         assert!(error.contains("not configured"), "{answer}");
         let answer = jev_screen(&tools, &serde_json::json!({"text": "t"})).await;

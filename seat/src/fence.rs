@@ -230,6 +230,9 @@ fn run_bounded_escape(
     allowed_extra: &[PathBuf],
     protected_roots: &[PathBuf],
 ) -> Option<PathBuf> {
+    if protected_roots.is_empty() {
+        return None;
+    }
     let program = args
         .get("program")
         .and_then(Value::as_str)
@@ -246,12 +249,49 @@ fn run_bounded_escape(
             }
         }
     }
-    let command = parts.join(" ");
-    let synthetic = serde_json::json!({"command": command})
-        .as_object()
-        .unwrap()
-        .clone();
-    shell_escape(&synthetic, cwd, allowed_extra, protected_roots)
+    let lexical_base = resolved_clean(cwd);
+    run_argv_protected_escape(&parts, &lexical_base, cwd, allowed_extra, protected_roots)
+}
+
+/// Protected-root check on the argv that `run_bounded` will execute (not a
+/// space-joined shell string).
+fn run_argv_protected_escape(
+    parts: &[String],
+    lexical_base: &Path,
+    worktree_cwd: &Path,
+    allowed_extra: &[PathBuf],
+    protected_roots: &[PathBuf],
+) -> Option<PathBuf> {
+    let mut i = 0;
+    while i < parts.len() {
+        let token = parts[i].trim();
+        if token.eq_ignore_ascii_case("-c") || token.eq_ignore_ascii_case("-lc") {
+            if let Some(script) = parts.get(i + 1) {
+                if let Some(hit) = shell_command_protected_escape(
+                    script,
+                    lexical_base,
+                    worktree_cwd,
+                    allowed_extra,
+                    protected_roots,
+                ) {
+                    return Some(hit);
+                }
+                i += 2;
+                continue;
+            }
+        }
+        for candidate in path_candidates_from_token(token) {
+            if let Some(path) = resolve_shell_candidate_path(&candidate, lexical_base) {
+                if let Some(hit) =
+                    hits_protected_root(&path, protected_roots, worktree_cwd, allowed_extra)
+                {
+                    return Some(hit);
+                }
+            }
+        }
+        i += 1;
+    }
+    None
 }
 
 fn shell_escape(

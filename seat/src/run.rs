@@ -22,10 +22,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use cursor_sdk::{
-    Agent, AgentOptions, Client, Error, LocalAgent, McpServer, Model, ModelChoice, Run, RunEvent,
-    RunOutcome, SendOptions, SettingSource, StreamMessage, TokenUsage,
+    Agent, AgentOptions, Client, Error, ErrorKind, LocalAgent, McpServer, Model, ModelChoice, Run,
+    RunEvent, RunOutcome, SendOptions, SettingSource, StreamMessage, TokenUsage,
 };
-use serde_json::Value;
+use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
 use crate::clip::{archive_text, bound_output, bound_output_with_path};
@@ -107,10 +107,9 @@ pub async fn run_seat(
         .await;
     }
 
-    let mut replace_disallowed_applied = false;
+    let mut replace_disallowed_added = Vec::new();
     if request.toolgate.mode.is_replace() {
-        apply_replace_disallowed(&mut request);
-        replace_disallowed_applied = true;
+        replace_disallowed_added = apply_replace_disallowed(&mut request);
     }
 
     emit(SeatEventKind::SeatStarted {
@@ -348,9 +347,12 @@ pub async fn run_seat(
     .await
     {
         Ok(agent) => agent,
-        Err(_error) if replace_disallowed_applied => {
-            revert_replace_disallowed(&mut request);
-            replace_disallowed_applied = false;
+        Err(error)
+            if !replace_disallowed_added.is_empty()
+                && create_agent_disallowed_tool_rejection(&error) =>
+        {
+            revert_replace_disallowed(&mut request, &replace_disallowed_added);
+            replace_disallowed_added.clear();
             options = match build_options(&request, choice, pruned.as_ref()) {
                 Ok(options) => options,
                 Err(reason) => {
@@ -1846,12 +1848,59 @@ fn tool_result_chars(message: &StreamMessage) -> u64 {
         .payload
         .get("result")
         .or_else(|| message.payload.get("message")?.get("result"));
+    let name = tool_label(message);
     match result {
+        Some(value) if is_seat_custom_tool(&name) => custom_tool_result_wire_chars(value),
         Some(Value::String(text)) => text.chars().count() as u64,
+        Some(Value::Object(map)) => map
+            .get("text")
+            .and_then(Value::as_str)
+            .map(|text| text.chars().count() as u64)
+            .unwrap_or_else(|| {
+                serde_json::to_string(map)
+                    .map(|text| text.chars().count() as u64)
+                    .unwrap_or(0)
+            }),
         Some(value) => serde_json::to_string(value)
             .map(|text| text.chars().count() as u64)
             .unwrap_or(0),
         None => 0,
+    }
+}
+
+/// JSON body the bridge returns from `CallCustomTool` (see SDK callback server).
+fn custom_tool_result_wire_chars(result: &Value) -> u64 {
+    let wrapped = match result {
+        Value::Object(_) => result.clone(),
+        other => json!({"value": other}),
+    };
+    json!({"result": wrapped}).to_string().chars().count() as u64
+}
+
+fn is_seat_custom_tool(name: &str) -> bool {
+    let lower = name.trim().to_lowercase();
+    for (tool, _) in SEAT_TOOLS {
+        if lower == tool {
+            return true;
+        }
+    }
+    for (tool, _) in TOOLGATE_TOOLS {
+        if lower == tool {
+            return true;
+        }
+    }
+    false
+}
+
+/// `CreateAgent` rejected an entry in `disallowed_tools` (not any validation error).
+fn create_agent_disallowed_tool_rejection(error: &Error) -> bool {
+    match error {
+        Error::Rpc(rpc) => {
+            rpc.kind == ErrorKind::Validation
+                && rpc.rpc.ends_with("CreateAgent")
+                && rpc.message.to_ascii_lowercase().contains("disallowed")
+        }
+        _ => false,
     }
 }
 
