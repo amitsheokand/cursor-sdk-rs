@@ -67,14 +67,13 @@
       checks = forAllSystems (
         system:
         let
-          pkgs = nixpkgs.legacyPackages.${system};
+          pkgs = import nixpkgs {
+            inherit system;
+            overlays = [ self.overlays.default ];
+          };
         in
         {
-          nix-files = pkgs.runCommand "cursor-sdk-rs-nix-files" { } ''
-            test -f ${./nix/cursor-sdk-bridge.nix}
-            test -f ${./nix/cursor-seat.nix}
-            printf 'ok\n' > "$out"
-          '';
+          cursor-seat = pkgs.cursor-seat;
         }
       );
 

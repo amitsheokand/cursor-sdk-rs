@@ -40,3 +40,21 @@ test result: ok. 11 passed; 0 failed; ...
 test result: ok. 10 passed; 0 failed; ...
 test result: ok. 3 passed; 0 failed; ...
 ```
+
+## Review round 1
+
+Grok NO-GO: `doCheck` off and `checks` only tested nix file existence. Fixed: `checks.<system>.cursor-seat` builds the package (check phase runs `cargo test -p cursor-seat`); `cleanSourceWith` on `lib.cleanSource` excludes `result` / `result-*`; sandbox skips only git- or `$HOME`-dependent fence tests (documented in `nix/cursor-seat.nix`).
+
+```text
+$ nix flake check -L
+checking derivation checks.x86_64-linux.cursor-seat...
+derivation evaluated to /nix/store/pwyb5s63f6fwmsxs4irrwgwqs8g79vl3-cursor-seat-0.1.0.drv
+all checks passed!
+
+$ nix build .#cursor-seat -L
+cursor-seat> checkPhase completed in 39 seconds
+cursor-seat> test result: ok. 92 passed; 0 failed; 0 ignored; 0 measured; 13 filtered out; finished in 0.05s
+cursor-seat> test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 11 filtered out; finished in 0.01s
+cursor-seat> test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.86s
+cursor-seat> stripping (with command strip and flags -S -p) in .../bin
+```
