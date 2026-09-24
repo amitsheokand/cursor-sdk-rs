@@ -388,7 +388,7 @@ async fn replace_falls_back_only_when_create_agent_rejects_disallowed_tool() {
     bridge.expect("SdkCursorService/ListModels", list_models_reply());
     bridge.expect(
         "SdkAgentService/CreateAgent",
-        validation_create_agent_error("disallowed tool shell is not supported"),
+        validation_create_agent_error("unknown tool name: shell"),
     );
     bridge.expect(
         "SdkAgentService/CreateAgent",
@@ -494,7 +494,7 @@ async fn tool_stats_counts_custom_tool_callback_wire_size() {
     let bridge = FakeBridge::start().await;
     script_models_create_close(&bridge);
     let payload = json!({"path": "sample.txt", "lines": "1|a"});
-    let expected = json!({"result": payload}).to_string().chars().count() as u64;
+    let expected = payload.to_string().chars().count() as u64;
     bridge.expect(
         "SdkAgentService/Send",
         Reply::Stream(vec![

@@ -29,13 +29,13 @@
 ## 5. Measurement
 
 - `SeatResult.tool_stats: {name: {calls, result_chars}}` from completed `tool_call` events.
-- Built-in tools: prefer `result.text` char count; seat custom tools: `{"result": …}` wire size (SDK callback JSON).
+- Built-in tools: prefer `result.text` char count; seat custom tools: proto `Struct` JSON (`json_to_object_struct`: object as-is, scalar as `{"value":…}`).
 - Documented in `PROTOCOL.md`.
 
 ## 6. Replace mode
 
 - Adds `read`, `edit`, `write`, `shell` to `disallowed_tools` (keeps `task`); tracks names added for selective revert.
-- On `CreateAgent` **disallowed-tool** validation failure only: revert added names, warning, retry without replace disallows.
+- On `CreateAgent` with `SdkErrorCode::ValidationError` (unknown tool name in `disallowed_tools`): revert added names, warning, retry without replace disallows.
 
 ## Review round 1 (grok NO-GO)
 
@@ -44,6 +44,13 @@
 | `run_bounded` ran before fence; space-joined command ≠ argv | `tool_escape` in `run_bounded` before `run`; `run_argv_protected_escape` | `run_bounded_into_protected_root_returns_error_before_run` |
 | Any `create_agent` error triggered replace→add; revert dropped pre-existing disallows | `create_agent_disallowed_tool_rejection`; `revert_replace_disallowed(request, added)` | `replace_falls_back_only_when_create_agent_rejects_disallowed_tool`, `replace_does_not_fallback_on_unrelated_create_agent_error`, `revert_replace_only_removes_names_this_attempt_added` |
 | `tool_stats` counted serde JSON of stream `result`, not model wire text | Custom-tool callback wrap; built-in `text` field | `tool_stats_count_completed_tool_calls` (`5`), `tool_stats_counts_custom_tool_callback_wire_size` |
+
+## Review round 2 (grok re-review NO-GO)
+
+| Finding | Fix | Test |
+|--------|-----|------|
+| `custom_tool_result_wire_chars` used JSON callback `{"result":…}` envelope, not proto `Struct` JSON | Count object/scalar wire like `json_to_object_struct` (no `result` wrapper) | `tool_stats_counts_custom_tool_callback_wire_size` (exact `payload` JSON length) |
+| Replace→add fallback required `"disallowed"` in RPC message | Match `SdkAgentService/CreateAgent` + `SdkErrorCode::ValidationError` only (`sdk_error_code`, not message substring) | `replace_falls_back_only_when_create_agent_rejects_disallowed_tool` (`unknown tool name: shell`), `replace_does_not_fallback_on_unrelated_create_agent_error` (`InvalidModel`) |
 
 ## Deviations
 
@@ -55,13 +62,14 @@
 ### `nix develop -c cargo test -p cursor-seat`
 
 ```
-test result: ok. 109 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
-test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
-test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
-test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
-test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
-test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
-test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 109 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.76s
+test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.58s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.87s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
 ```
 
 ### `nix develop -c cargo fmt --check`
@@ -73,6 +81,6 @@ test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 ### `nix build .#cursor-seat`
 
 ```
-building '/nix/store/hgaxp10l9hrc1nibxjv5v5ga75q5xa0v-cursor-seat-0.1.0.drv'...
+building '/nix/store/j64qnprp7y68rr2qb2jxrq216azx37kq-cursor-seat-0.1.0.drv'...
 (exit 0)
 ```

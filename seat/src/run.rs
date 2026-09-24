@@ -21,9 +21,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use cursor_sdk::proto::SdkErrorCode;
 use cursor_sdk::{
-    Agent, AgentOptions, Client, Error, ErrorKind, LocalAgent, McpServer, Model, ModelChoice, Run,
-    RunEvent, RunOutcome, SendOptions, SettingSource, StreamMessage, TokenUsage,
+    Agent, AgentOptions, Client, Error, LocalAgent, McpServer, Model, ModelChoice, Run, RunEvent,
+    RunOutcome, SendOptions, SettingSource, StreamMessage, TokenUsage,
 };
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
@@ -1868,13 +1869,15 @@ fn tool_result_chars(message: &StreamMessage) -> u64 {
     }
 }
 
-/// JSON body the bridge returns from `CallCustomTool` (see SDK callback server).
+/// Proto `CallCustomToolResponse.result` as JSON (`json_to_object_struct`; see callback server).
 fn custom_tool_result_wire_chars(result: &Value) -> u64 {
-    let wrapped = match result {
+    let wire = match result {
         Value::Object(_) => result.clone(),
         other => json!({"value": other}),
     };
-    json!({"result": wrapped}).to_string().chars().count() as u64
+    serde_json::to_string(&wire)
+        .map(|text| text.chars().count() as u64)
+        .unwrap_or(0)
 }
 
 fn is_seat_custom_tool(name: &str) -> bool {
@@ -1892,13 +1895,12 @@ fn is_seat_custom_tool(name: &str) -> bool {
     false
 }
 
-/// `CreateAgent` rejected an entry in `disallowed_tools` (not any validation error).
+/// `CreateAgent` failed because a tool name in `disallowed_tools` is unknown to the SDK.
 fn create_agent_disallowed_tool_rejection(error: &Error) -> bool {
     match error {
         Error::Rpc(rpc) => {
-            rpc.kind == ErrorKind::Validation
-                && rpc.rpc.ends_with("CreateAgent")
-                && rpc.message.to_ascii_lowercase().contains("disallowed")
+            rpc.rpc.ends_with("CreateAgent")
+                && rpc.sdk_error_code == SdkErrorCode::ValidationError as i32
         }
         _ => false,
     }
