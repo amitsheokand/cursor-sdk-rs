@@ -21,6 +21,20 @@ client.close().await?;
 
 ## Install
 
+### Nix
+
+On NixOS (or with `nix-ld`), the flake builds `cursor-seat` and vendors the
+matching **v1.0.31** `cursor-sdk-bridge` standalone binary (Bun compile output —
+not patched in the store; the dynamic loader resolves it like any other ELF).
+
+```bash
+nix build .#cursor-seat
+nix build .#cursor-sdk-bridge
+nix develop   # sets CURSOR_SDK_BRIDGE_BIN to the packaged bridge
+```
+
+### Crates.io
+
 ```toml
 [dependencies]
 cursor-sdk-rs = "1.0.31"
