@@ -14,6 +14,7 @@
 |---------|--------|-----|
 | `cursor-sdk-bridge` | none (fetch only) | prebuilt binary; no build |
 | `cursor-seat` | `makeWrapper` | `postInstall` wrapper for bridge default |
+| `cursor-seat` (check) | `git` | fence/git tests init repos in `preCheck` with writable `HOME=$TMPDIR` |
 
 No `protoc`: `build.rs` uses prost-build + protox (verified by successful `nix build`).
 
@@ -56,5 +57,27 @@ cursor-seat> checkPhase completed in 39 seconds
 cursor-seat> test result: ok. 92 passed; 0 failed; 0 ignored; 0 measured; 13 filtered out; finished in 0.05s
 cursor-seat> test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 11 filtered out; finished in 0.01s
 cursor-seat> test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.86s
+cursor-seat> stripping (with command strip and flags -S -p) in .../bin
+```
+
+## Review round 2
+
+Removed 24 `checkFlags` git/`$HOME` skips; `nativeCheckInputs = [ git ]` and `preCheck` sets `HOME=$TMPDIR`, `GIT_CONFIG_NOSYSTEM=1`, and throwaway `git config --global user.name` / `user.email`. No network-only skip (loopback integration tests pass in the Nix check sandbox).
+
+```text
+$ nix flake check -L
+checking derivation checks.x86_64-linux.cursor-seat...
+derivation evaluated to /nix/store/hyxv0v1v6js642ry9vrskd281jzzf8wi-cursor-seat-0.1.0.drv
+all checks passed!
+
+$ nix build .#cursor-seat -L
+cursor-seat> test result: ok. 105 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+cursor-seat> test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.13s
+cursor-seat> test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+cursor-seat> test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+cursor-seat> test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+cursor-seat> test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.86s
+cursor-seat> test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+cursor-seat> checkPhase completed in 52 seconds
 cursor-seat> stripping (with command strip and flags -S -p) in .../bin
 ```
