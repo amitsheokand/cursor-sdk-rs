@@ -21,30 +21,37 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use cursor_sdk::proto::SdkErrorCode;
 use cursor_sdk::{
     Agent, AgentOptions, Client, Error, LocalAgent, McpServer, Model, ModelChoice, Run, RunEvent,
     RunOutcome, SendOptions, SettingSource, StreamMessage, TokenUsage,
 };
-use serde_json::Value;
+use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
 use crate::clip::{archive_text, bound_output, bound_output_with_path};
-use crate::fence::{drift, rebaseline_entries, snapshot, snapshot_and_attribute, AttributeResult, Digest};
 use crate::context::build_context;
+use crate::fence::{
+    drift, rebaseline_entries, snapshot, snapshot_and_attribute, AttributeResult, Digest,
+};
 use crate::inbox::Inbox;
+use crate::jev::register_tools;
 use crate::jev::{
-    JevHandle, PruneCandidate, SeatTools, CHECK_SELF, CHECK_TRIAGE, SEAT_TOOLS,
-    TOOL_JEV_SCREEN, TOOL_JEV_VERIFY, TOOL_SKILL_USE,
+    JevHandle, PruneCandidate, SeatTools, CHECK_SELF, CHECK_TRIAGE, SEAT_TOOLS, TOOL_JEV_SCREEN,
+    TOOL_JEV_VERIFY, TOOL_SKILL_USE,
 };
 use crate::protocol::{
     ControlMode, McpServerConfig, Outcome, SeatEvent, SeatEventKind, SeatRequest, SeatResult,
-    SeatUsage, SelfCheck,
+    SeatUsage, SelfCheck, ToolStat,
 };
-use crate::jev::register_tools;
 use crate::retry::{
     classify, classify_run_status, retry_delay, should_retry_in_seat, RetryPolicy, SeatFailure,
 };
-use crate::session::{Opened, OpState, SessionError, SessionStore};
+use crate::session::{OpState, Opened, SessionError, SessionStore};
+use crate::toolgate::{
+    apply_replace_disallowed, register_toolgate_tools, revert_replace_disallowed, ToolgateContext,
+    TOOLGATE_TOOLS,
+};
 
 /// Cap on consecutive stream resumes; past it the seat stops replaying
 /// and falls back to `WaitLiveRun` so a flapping stream cannot starve
@@ -101,6 +108,11 @@ pub async fn run_seat(
         .await;
     }
 
+    let mut replace_disallowed_added = Vec::new();
+    if request.toolgate.mode.is_replace() {
+        replace_disallowed_added = apply_replace_disallowed(&mut request);
+    }
+
     emit(SeatEventKind::SeatStarted {
         request_id: request.request_id.clone(),
     });
@@ -115,10 +127,7 @@ pub async fn run_seat(
     // declarations reach its options. Unavailable tools stay declared
     // and answer `not configured`.
     let seat_tools = Arc::new(SeatTools {
-        jev: match (
-            request.jev.enabled,
-            request.jev.questions_dir.as_deref(),
-        ) {
+        jev: match (request.jev.enabled, request.jev.questions_dir.as_deref()) {
             (true, Some(dir)) => JevHandle::load(Path::new(dir)).ok(),
             _ => None,
         },
@@ -147,27 +156,47 @@ pub async fn run_seat(
                     description: description.to_string(),
                 });
             }
+            if request.toolgate.mode.is_active() {
+                for (name, description) in TOOLGATE_TOOLS {
+                    if name == crate::toolgate::TOOL_RUN_GATES && request.toolgate.gates.is_empty()
+                    {
+                        continue;
+                    }
+                    candidates.push(PruneCandidate {
+                        name: name.to_string(),
+                        description: description.to_string(),
+                    });
+                }
+            }
             let summary = format!(
                 "{}\n{}\n{}",
                 request.prompt.task,
                 request.prompt.effort_tag,
                 request.prompt.body.chars().take(2000).collect::<String>(),
             );
-            if let Some((kept, floor)) =
-                crate::jev::select_tools(jev, &summary, &candidates).await
+            if let Some((kept, floor)) = crate::jev::select_tools(jev, &summary, &candidates).await
             {
                 emit(SeatEventKind::Jev {
                     check: crate::jev::SELECT_TOOLS_CHECK.to_string(),
                     verdict: kept.join(","),
                     p: floor,
                 });
-                request.mcp_servers
+                request
+                    .mcp_servers
                     .retain(|server| kept.iter().any(|name| name == &server.name));
                 pruned = Some(kept.into_iter().collect());
             }
         }
     }
     register_tools(client, Arc::clone(&seat_tools), pruned.as_ref()).await;
+    let toolgate_ctx = if request.toolgate.mode.is_active() {
+        Some(Arc::new(ToolgateContext::from_request(&request)))
+    } else {
+        None
+    };
+    if let Some(ctx) = toolgate_ctx.as_ref() {
+        register_toolgate_tools(client, Arc::clone(ctx), pruned.as_ref()).await;
+    }
 
     // At-most-once dispatch: replay or attach before any pre-start work.
     // The decision is cloned out first so the arms can move the store.
@@ -286,7 +315,7 @@ pub async fn run_seat(
     };
 
     // Phase B: agent options (local validation, no wire).
-    let options = match build_options(&request, choice, pruned.as_ref()) {
+    let options = match build_options(&request, choice.clone(), pruned.as_ref()) {
         Ok(options) => options,
         Err(reason) => {
             return terminal(
@@ -312,10 +341,73 @@ pub async fn run_seat(
     };
 
     // Phase C: create (no agent exists on failure: nothing leaks).
-    let agent = match retry_op(&key, policy, &mut attempts, || client.create_agent(options.clone()))
-        .await
+    let mut options = options;
+    let agent = match retry_op(&key, policy, &mut attempts, || {
+        client.create_agent(options.clone())
+    })
+    .await
     {
         Ok(agent) => agent,
+        Err(error)
+            if !replace_disallowed_added.is_empty()
+                && create_agent_disallowed_tool_rejection(&error) =>
+        {
+            revert_replace_disallowed(&mut request, &replace_disallowed_added);
+            replace_disallowed_added.clear();
+            options = match build_options(&request, choice, pruned.as_ref()) {
+                Ok(options) => options,
+                Err(reason) => {
+                    return terminal(
+                        &request,
+                        SeatFailure {
+                            outcome: Outcome::Bounced,
+                            error_kind: Some("Validation".to_string()),
+                            retryable: false,
+                            retry_after_ms: None,
+                            request_id: None,
+                        },
+                        reason,
+                        attempts,
+                        wall_start,
+                        built.changes.clone(),
+                        inbox,
+                        &mut session,
+                        seat_tools.jev.as_ref(),
+                        &mut emit,
+                    )
+                    .await;
+                }
+            };
+            emit(SeatEventKind::Status {
+                status: "warning".to_string(),
+                message: Some(
+                    "toolgate replace: SDK rejected a disallowed built-in name; fell back to add"
+                        .to_string(),
+                ),
+            });
+            match retry_op(&key, policy, &mut attempts, || {
+                client.create_agent(options.clone())
+            })
+            .await
+            {
+                Ok(agent) => agent,
+                Err(error) => {
+                    return terminal(
+                        &request,
+                        classify(&error),
+                        error.to_string(),
+                        attempts,
+                        wall_start,
+                        built.changes.clone(),
+                        inbox,
+                        &mut session,
+                        seat_tools.jev.as_ref(),
+                        &mut emit,
+                    )
+                    .await;
+                }
+            }
+        }
         Err(error) => {
             return terminal(
                 &request,
@@ -341,11 +433,7 @@ pub async fn run_seat(
         .into_iter()
         .collect();
     let guard_tools = !request.fence.is_empty() || !request.protected_roots.is_empty();
-    let protected_roots: Vec<PathBuf> = request
-        .protected_roots
-        .iter()
-        .map(PathBuf::from)
-        .collect();
+    let protected_roots: Vec<PathBuf> = request.protected_roots.iter().map(PathBuf::from).collect();
     let protected_before = if protected_roots.is_empty() {
         None
     } else {
@@ -480,14 +568,8 @@ pub async fn run_seat(
                              what is missing, or end the turn if nothing is missing.",
                             answer.p
                         );
-                        record(&mut session, |store| {
-                            store.set_state(OpState::Awaiting)
-                        });
-                        let options = followup_options(
-                            &catalog,
-                            &request,
-                            flags.effort.as_deref(),
-                        );
+                        record(&mut session, |store| store.set_state(OpState::Awaiting));
+                        let options = followup_options(&catalog, &request, flags.effort.as_deref());
                         match agent.send_with(followup, options).await {
                             Ok(next) => {
                                 turns += 1;
@@ -509,7 +591,9 @@ pub async fn run_seat(
                                         protected_roots: protected_roots.clone(),
                                         fence_entries: request.fence.clone(),
                                         protected_baseline: flags.protected_baseline.clone(),
-                                        fence_external_emitted: flags.fence_external_emitted.clone(),
+                                        fence_external_emitted: flags
+                                            .fence_external_emitted
+                                            .clone(),
                                     },
                                 )
                                 .await;
@@ -539,9 +623,7 @@ pub async fn run_seat(
                                     check = Some(SelfCheck {
                                         passed: false,
                                         turns,
-                                        reason: Some(
-                                            "follow-up turn did not succeed".to_string(),
-                                        ),
+                                        reason: Some("follow-up turn did not succeed".to_string()),
                                     });
                                     break;
                                 }
@@ -587,7 +669,11 @@ async fn is_trivial(jev: &crate::jev::JevHandle, request: &SeatRequest) -> bool 
         "effort_tag": request.prompt.effort_tag,
         "body": request.prompt.body.chars().take(2000).collect::<String>(),
     });
-    match jev.ask(CHECK, &state).await.and_then(|a| crate::jev::parse_noul(&a)) {
+    match jev
+        .ask(CHECK, &state)
+        .await
+        .and_then(|a| crate::jev::parse_noul(&a))
+    {
         Ok(p) => p >= 0.5,
         Err(_) => false,
     }
@@ -596,15 +682,9 @@ async fn is_trivial(jev: &crate::jev::JevHandle, request: &SeatRequest) -> bool 
 /// Send options for a self-check follow-up: the agent's model, rebuilt
 /// with a `settings` effort override when one arrived. An invalid
 /// override falls back to the agent model rather than killing the turn.
-fn followup_options(
-    catalog: &[Model],
-    request: &SeatRequest,
-    effort: Option<&str>,
-) -> SendOptions {
+fn followup_options(catalog: &[Model], request: &SeatRequest, effort: Option<&str>) -> SendOptions {
     match effort {
-        Some(effort)
-            if Some(effort) != request.model.params.effort.as_deref() =>
-        {
+        Some(effort) if Some(effort) != request.model.params.effort.as_deref() => {
             match resolve_model(
                 catalog,
                 &request.model.id,
@@ -661,9 +741,7 @@ where
         *attempts += 1;
         match op().await {
             Ok(value) => return Ok(value),
-            Err(error)
-                if should_retry_in_seat(&error) && *attempts < policy.max_attempts =>
-            {
+            Err(error) if should_retry_in_seat(&error) && *attempts < policy.max_attempts => {
                 let delay = retry_delay(policy, key, *attempts - 1, error.retry_after());
                 tokio::time::sleep(delay).await;
             }
@@ -719,9 +797,7 @@ fn resolve_model(
         choice = choice.with_param("fast", "false");
     }
     for (id, value) in extra {
-        if !model.parameters.is_empty()
-            && !model.parameters.iter().any(|param| &param.id == id)
-        {
+        if !model.parameters.is_empty() && !model.parameters.iter().any(|param| &param.id == id) {
             return Err(format!(
                 "unknown model param `{id}` for model `{}`",
                 model.id
@@ -768,13 +844,23 @@ fn build_options(
                 enabled.push(tool.to_string());
             }
         }
+        if request.toolgate.mode.is_active() {
+            for (name, _) in TOOLGATE_TOOLS {
+                if name == crate::toolgate::TOOL_RUN_GATES && request.toolgate.gates.is_empty() {
+                    continue;
+                }
+                if pruned.map_or(true, |keep| keep.contains(name))
+                    && !enabled.iter().any(|t| t == name)
+                {
+                    enabled.push(name.to_string());
+                }
+            }
+        }
         options = options.tools(enabled);
     }
     options = options
         .disallowed_tools(request.disallowed_tools.clone())
-        .local_options(
-            LocalAgent::new(&request.cwd).setting_sources(Vec::<SettingSource>::new()),
-        );
+        .local_options(LocalAgent::new(&request.cwd).setting_sources(Vec::<SettingSource>::new()));
     for server in &request.mcp_servers {
         let mapped = if let Some(url) = server.url.as_deref() {
             McpServer::http(url)
@@ -890,11 +976,8 @@ async fn attach(
                 .map(PathBuf::from)
                 .into_iter()
                 .collect();
-            let protected_roots: Vec<PathBuf> = request
-                .protected_roots
-                .iter()
-                .map(PathBuf::from)
-                .collect();
+            let protected_roots: Vec<PathBuf> =
+                request.protected_roots.iter().map(PathBuf::from).collect();
             let guard_tools = !request.fence.is_empty() || !request.protected_roots.is_empty();
             // On resume, protected-root snapshots only cover changes after re-attach.
             let protected_before = if protected_roots.is_empty() {
@@ -1156,9 +1239,17 @@ async fn drive(
         }
     };
 
-    let mut result =
-        finish(request, outcome, &state, attempts, wall_start, context_changes, handles, session)
-            .await;
+    let mut result = finish(
+        request,
+        outcome,
+        &state,
+        attempts,
+        wall_start,
+        context_changes,
+        handles,
+        session,
+    )
+    .await;
     if let Some(path) = state.fence_escape.clone() {
         result = fence_escape_result(
             request,
@@ -1199,6 +1290,7 @@ struct DriveState {
     fence_checked_tool_calls: HashSet<String>,
     protected_baseline: Option<Digest>,
     fence_external_emitted: HashSet<String>,
+    tool_stats: std::collections::BTreeMap<String, ToolStat>,
 }
 
 /// Record run/agent ids; on first sight emit `run_started` and fire a
@@ -1220,9 +1312,7 @@ async fn observe_ids(
             let agent_id = handles.agent_id.clone();
             state.agent_id = Some(agent_id.clone());
             state.run_started_emitted = true;
-            record(session, |store| {
-                store.record_run(&run_id, &agent_id)
-            });
+            record(session, |store| store.record_run(&run_id, &agent_id));
             emit(SeatEventKind::RunStarted {
                 run_id: run_id.clone(),
                 agent_id,
@@ -1244,9 +1334,7 @@ async fn apply_control(
     state: &mut DriveState,
     session: &mut Option<SessionStore>,
 ) {
-    record(session, |store| {
-        store.record_control(&input.id)
-    });
+    record(session, |store| store.record_control(&input.id));
     match input.mode {
         ControlMode::Hard => {
             if let Some(run_id) = state.run_id.clone() {
@@ -1269,7 +1357,11 @@ async fn apply_control(
     }
 }
 
-async fn snapshot_async(protected_roots: &[PathBuf], fence: &[String], cwd: &Path) -> Option<Digest> {
+async fn snapshot_async(
+    protected_roots: &[PathBuf],
+    fence: &[String],
+    cwd: &Path,
+) -> Option<Digest> {
     let roots = protected_roots.to_vec();
     let fence = fence.to_vec();
     let cwd = cwd.to_path_buf();
@@ -1434,12 +1526,7 @@ async fn apply_post_drive_fence(
                 }
                 Err(_) => {
                     result = fence_drift_result(
-                        request,
-                        &listing,
-                        &result,
-                        attempts,
-                        wall_start,
-                        session,
+                        request, &listing, &result, attempts, wall_start, session,
                     );
                 }
             }
@@ -1478,9 +1565,7 @@ fn tool_call_fence_already_checked(message: &StreamMessage, state: &mut DriveSta
     if call_id.is_empty() {
         return false;
     }
-    !state
-        .fence_checked_tool_calls
-        .insert(call_id.to_string())
+    !state.fence_checked_tool_calls.insert(call_id.to_string())
 }
 
 async fn emit_fence_escape(
@@ -1622,6 +1707,7 @@ fn fence_escape_result(
         self_check: None,
         context_changes,
         resumed: prior.resumed,
+        tool_stats: prior.tool_stats.clone(),
     };
     record(session, |store| {
         store.record_result(&result)?;
@@ -1659,6 +1745,7 @@ fn fence_drift_result(
         self_check: None,
         context_changes: prior.context_changes.clone(),
         resumed: prior.resumed,
+        tool_stats: prior.tool_stats.clone(),
     };
     record(session, |store| {
         store.record_result(&result)?;
@@ -1700,7 +1787,9 @@ fn emit_message(
         }
         "tool_call" => {
             let label = tool_label(&message);
-            let status = str_field(&message, "status").unwrap_or_default().to_string();
+            let status = str_field(&message, "status")
+                .unwrap_or_default()
+                .to_string();
             let call_id = str_field(&message, "call_id")
                 .or_else(|| str_field(&message, "callId"))
                 .unwrap_or_default()
@@ -1720,6 +1809,7 @@ fn emit_message(
                 status,
                 call_id,
             });
+            record_tool_stats(state, &message);
         }
         "usage" => {
             if let Some(usage) = seat_usage_from(&message) {
@@ -1729,11 +1819,90 @@ fn emit_message(
         }
         "status" => {
             emit(SeatEventKind::Status {
-                status: str_field(&message, "status").unwrap_or_default().to_string(),
+                status: str_field(&message, "status")
+                    .unwrap_or_default()
+                    .to_string(),
                 message: str_field(&message, "message").map(str::to_string),
             });
         }
         _ => {}
+    }
+}
+
+fn record_tool_stats(state: &mut DriveState, message: &StreamMessage) {
+    if message.kind.as_str() != "tool_call" {
+        return;
+    }
+    let status = str_field(message, "status").unwrap_or_default();
+    if status != "completed" {
+        return;
+    }
+    let name = tool_label(message);
+    let chars = tool_result_chars(message);
+    let entry = state.tool_stats.entry(name).or_default();
+    entry.calls += 1;
+    entry.result_chars += chars;
+}
+
+fn tool_result_chars(message: &StreamMessage) -> u64 {
+    let result = message
+        .payload
+        .get("result")
+        .or_else(|| message.payload.get("message")?.get("result"));
+    let name = tool_label(message);
+    match result {
+        Some(value) if is_seat_custom_tool(&name) => custom_tool_result_wire_chars(value),
+        Some(Value::String(text)) => text.chars().count() as u64,
+        Some(Value::Object(map)) => map
+            .get("text")
+            .and_then(Value::as_str)
+            .map(|text| text.chars().count() as u64)
+            .unwrap_or_else(|| {
+                serde_json::to_string(map)
+                    .map(|text| text.chars().count() as u64)
+                    .unwrap_or(0)
+            }),
+        Some(value) => serde_json::to_string(value)
+            .map(|text| text.chars().count() as u64)
+            .unwrap_or(0),
+        None => 0,
+    }
+}
+
+/// Proto `CallCustomToolResponse.result` as JSON (`json_to_object_struct`; see callback server).
+fn custom_tool_result_wire_chars(result: &Value) -> u64 {
+    let wire = match result {
+        Value::Object(_) => result.clone(),
+        other => json!({"value": other}),
+    };
+    serde_json::to_string(&wire)
+        .map(|text| text.chars().count() as u64)
+        .unwrap_or(0)
+}
+
+fn is_seat_custom_tool(name: &str) -> bool {
+    let lower = name.trim().to_lowercase();
+    for (tool, _) in SEAT_TOOLS {
+        if lower == tool {
+            return true;
+        }
+    }
+    for (tool, _) in TOOLGATE_TOOLS {
+        if lower == tool {
+            return true;
+        }
+    }
+    false
+}
+
+/// `CreateAgent` failed because a tool name in `disallowed_tools` is unknown to the SDK.
+fn create_agent_disallowed_tool_rejection(error: &Error) -> bool {
+    match error {
+        Error::Rpc(rpc) => {
+            rpc.rpc.ends_with("CreateAgent")
+                && rpc.sdk_error_code == SdkErrorCode::ValidationError as i32
+        }
+        _ => false,
     }
 }
 
@@ -1804,8 +1973,11 @@ pub fn tool_label(message: &StreamMessage) -> String {
 fn seat_usage_from(message: &StreamMessage) -> Option<SeatUsage> {
     let root = message.payload.get("usage").unwrap_or(&message.payload);
     let number = |key: &str| {
-        root.get(key)
-            .and_then(|value| value.as_i64().or_else(|| value.as_u64().map(|v| v.min(i64::MAX as u64) as i64)))
+        root.get(key).and_then(|value| {
+            value
+                .as_i64()
+                .or_else(|| value.as_u64().map(|v| v.min(i64::MAX as u64) as i64))
+        })
     };
     let usage = SeatUsage {
         input_tokens: number("input_tokens").map(|v| v.max(0) as u64),
@@ -1882,12 +2054,14 @@ async fn finish(
         retryable: false,
         retry_after_ms: None,
         request_id: request.request_id.clone(),
-        run_id: state.run_id.clone().or_else(|| {
-            Some(outcome.run_id.clone()).filter(|id| !id.is_empty())
-        }),
-        agent_id: state.agent_id.clone().or_else(|| {
-            (!handles.agent_id.is_empty()).then(|| handles.agent_id.clone())
-        }),
+        run_id: state
+            .run_id
+            .clone()
+            .or_else(|| Some(outcome.run_id.clone()).filter(|id| !id.is_empty())),
+        agent_id: state
+            .agent_id
+            .clone()
+            .or_else(|| (!handles.agent_id.is_empty()).then(|| handles.agent_id.clone())),
         model: Some(request.model.id.clone()),
         text,
         archive_path,
@@ -1898,6 +2072,7 @@ async fn finish(
         self_check: None,
         context_changes,
         resumed: state.resumed,
+        tool_stats: state.tool_stats.clone(),
     };
     // Result item before the terminal state: the crash invariant.
     record(session, |store| {
@@ -1965,6 +2140,7 @@ fn stream_failed(
         self_check: None,
         context_changes,
         resumed: state.resumed,
+        tool_stats: state.tool_stats.clone(),
     };
     record(session, |store| {
         store.record_result(&result)?;
@@ -2003,6 +2179,7 @@ fn timeout_result(
         self_check: None,
         context_changes,
         resumed: state.resumed,
+        tool_stats: state.tool_stats.clone(),
     };
     record(session, |store| {
         store.record_result(&result)?;
@@ -2054,6 +2231,7 @@ async fn terminal(
         self_check: None,
         context_changes,
         resumed: false,
+        tool_stats: std::collections::BTreeMap::new(),
     };
     // Pre-start terminal: result item first, then close the operation.
     // (No run exists, so the op moves straight from Ready.)

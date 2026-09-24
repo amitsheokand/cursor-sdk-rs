@@ -71,9 +71,7 @@ pub fn classify(error: &Error) -> SeatFailure {
                 ErrorKind::Unauthenticated
                 | ErrorKind::PermissionDenied
                 | ErrorKind::Validation => failure(Outcome::Bounced, kind, false),
-                ErrorKind::RateLimited | ErrorKind::AgentBusy => {
-                    failure(Outcome::Busy, kind, true)
-                }
+                ErrorKind::RateLimited | ErrorKind::AgentBusy => failure(Outcome::Busy, kind, true),
                 ErrorKind::Upstream | ErrorKind::Internal => {
                     failure(Outcome::StartupError, kind, true)
                 }
@@ -85,9 +83,7 @@ pub fn classify(error: &Error) -> SeatFailure {
                 _ => failure(Outcome::Failed, kind, false),
             }
         }
-        Error::Transport(_) | Error::Timeout { .. } => {
-            failure(Outcome::StartupError, None, true)
-        }
+        Error::Transport(_) | Error::Timeout { .. } => failure(Outcome::StartupError, None, true),
         Error::Config(_) => failure(Outcome::Bounced, None, false),
         Error::Bridge(_) | Error::Decode { .. } | Error::Io(_) => {
             failure(Outcome::StartupError, None, false)

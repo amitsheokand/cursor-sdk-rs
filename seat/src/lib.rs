@@ -13,5 +13,6 @@ pub mod protocol;
 pub mod retry;
 pub mod run;
 pub mod session;
+pub mod toolgate;
 
 pub use protocol::*;

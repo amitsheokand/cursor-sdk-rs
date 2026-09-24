@@ -89,9 +89,7 @@ fn check_semantics(input: &ControlInput, parameters_present: bool) -> Result<(),
                 ));
             }
             if input.reason.is_empty() {
-                return Err(InboxError::Invalid(
-                    "heartbeat reason is empty".to_string(),
-                ));
+                return Err(InboxError::Invalid("heartbeat reason is empty".to_string()));
             }
         }
         ControlMode::Settings => {
@@ -147,9 +145,7 @@ impl InboxHandle {
     /// dropped by the task.
     pub fn submit(&self, input: ControlInput) -> Result<(), InboxError> {
         check_semantics(&input, input.parameters.is_some())?;
-        self.submit_tx
-            .send(input)
-            .map_err(|_| InboxError::Closed)?;
+        self.submit_tx.send(input).map_err(|_| InboxError::Closed)?;
         Ok(())
     }
 }
@@ -161,9 +157,7 @@ impl Inbox {
         let mut seen = HashSet::with_capacity(seen_ids.len());
         for id in seen_ids {
             if id.is_empty() {
-                return Err(InboxError::Invalid(
-                    "seen input id is empty".to_string(),
-                ));
+                return Err(InboxError::Invalid("seen input id is empty".to_string()));
             }
             seen.insert(id.clone());
         }
@@ -251,12 +245,7 @@ mod tests {
     use super::*;
     use crate::protocol::{ControlKind, SettingsParams};
 
-    fn control(
-        id: &str,
-        mode: ControlMode,
-        reason: &str,
-        effort: Option<&str>,
-    ) -> ControlInput {
+    fn control(id: &str, mode: ControlMode, reason: &str, effort: Option<&str>) -> ControlInput {
         ControlInput {
             id: id.to_string(),
             kind: ControlKind::Control,
@@ -323,7 +312,12 @@ mod tests {
         assert_eq!(recv_one(&mut inbox).await, first);
         // Same id, different mode: accepted by submit, dropped by the task.
         inbox
-            .submit(control("same-input", ControlMode::WhenIdle, "different", None))
+            .submit(control(
+                "same-input",
+                ControlMode::WhenIdle,
+                "different",
+                None,
+            ))
             .unwrap();
         let second = hard("next-input");
         inbox.submit(second.clone()).unwrap();
@@ -435,17 +429,15 @@ mod tests {
     #[tokio::test]
     async fn rejects_invalid_input() {
         let inbox = Inbox::new(&[]).unwrap();
-        assert!(inbox.submit(control("", ControlMode::Hard, "r", None)).is_err());
-        assert!(
-            inbox
-                .submit(control("hb", ControlMode::Heartbeat, "", None))
-                .is_err()
-        );
-        assert!(
-            inbox
-                .submit(control("set", ControlMode::Settings, "", None))
-                .is_err()
-        );
+        assert!(inbox
+            .submit(control("", ControlMode::Hard, "r", None))
+            .is_err());
+        assert!(inbox
+            .submit(control("hb", ControlMode::Heartbeat, "", None))
+            .is_err());
+        assert!(inbox
+            .submit(control("set", ControlMode::Settings, "", None))
+            .is_err());
         inbox.close().await;
     }
 
@@ -458,7 +450,11 @@ mod tests {
 
     #[tokio::test]
     async fn control_messages_round_trip() {
-        for mode in [ControlMode::Hard, ControlMode::WhenIdle, ControlMode::Heartbeat] {
+        for mode in [
+            ControlMode::Hard,
+            ControlMode::WhenIdle,
+            ControlMode::Heartbeat,
+        ] {
             let mut inbox = Inbox::new(&[]).unwrap();
             let want = control("stop", mode, "stop now", None);
             let line = serde_json::to_string(&want).unwrap();

@@ -194,6 +194,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "toml",
+ "toolgate",
 ]
 
 [[package]]
@@ -1610,6 +1611,17 @@ name = "toml_write"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
+
+[[package]]
+name = "toolgate"
+version = "0.1.0"
+source = "git+https://github.com/amitsheokand/toolgate?rev=79b0e8c17abab48bf8d7f54afdbabda72993b9d4#79b0e8c17abab48bf8d7f54afdbabda72993b9d4"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+]
 
 [[package]]
 name = "tower"

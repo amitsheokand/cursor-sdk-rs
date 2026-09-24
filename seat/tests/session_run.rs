@@ -9,6 +9,7 @@ mod support;
 
 use std::path::PathBuf;
 
+use cursor_sdk::proto;
 use cursor_seat::inbox::Inbox;
 use cursor_seat::protocol::{
     Limits, ModelParams, ModelRef, Outcome, PromptPart, SeatEvent, SeatEventKind, SeatRequest,
@@ -16,7 +17,6 @@ use cursor_seat::protocol::{
 };
 use cursor_seat::run::run_seat;
 use cursor_seat::session::{Opened, SessionStore};
-use cursor_sdk::proto;
 use serde_json::json;
 use support::*;
 use tokio::sync::mpsc;
@@ -44,6 +44,7 @@ fn request_with_session(dir: &PathBuf) -> SeatRequest {
         tools_enabled: vec![],
         skill_roots: vec![],
         jev: Default::default(),
+        toolgate: Default::default(),
         limits: Limits {
             context_chars: 100_000,
             clip_chars: 40_000,

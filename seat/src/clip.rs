@@ -183,19 +183,25 @@ mod tests {
         let cases = [
             ("empty", "", "", 1, false),
             ("exact", "界é🙂", "界é🙂", 3, false),
-            ("even", "abcdefghij", "abc...4 bytes truncated...hij", 6, true),
+            (
+                "even",
+                "abcdefghij",
+                "abc...4 bytes truncated...hij",
+                6,
+                true,
+            ),
             ("odd", "abcdefghij", "ab...5 bytes truncated...hij", 5, true),
             ("one", "ab", "...1 bytes truncated...b", 1, true),
             ("two", "abc", "a...1 bytes truncated...c", 2, true),
-            ("unicode", "界éab🙂好", "界...4 bytes truncated...🙂好", 3, true),
-            ("ellipsis", "…abc…", "…...3 bytes truncated...…", 2, true),
             (
-                "unicode and newline exact",
-                "é\n🙂",
-                "é\n🙂",
+                "unicode",
+                "界éab🙂好",
+                "界...4 bytes truncated...🙂好",
                 3,
-                false,
+                true,
             ),
+            ("ellipsis", "…abc…", "…...3 bytes truncated...…", 2, true),
+            ("unicode and newline exact", "é\n🙂", "é\n🙂", 3, false),
             (
                 "unicode and newline truncated",
                 "é\n🙂",
@@ -210,7 +216,13 @@ mod tests {
                 4,
                 true,
             ),
-            ("whitespace", "a\nbc\td", "a\n...2 bytes truncated...\td", 4, true),
+            (
+                "whitespace",
+                "a\nbc\td",
+                "a\n...2 bytes truncated...\td",
+                4,
+                true,
+            ),
             ("newline", "\n", "\n", 1, false),
             ("quote", "\"", "\"", 1, false),
             ("backslashes", "\\\\", "\\\\", 2, false),
@@ -235,7 +247,13 @@ mod tests {
                 1,
                 true,
             ),
-            ("unicode separators", "<>&\u{2028}\u{2029}", "<>&\u{2028}\u{2029}", 5, false),
+            (
+                "unicode separators",
+                "<>&\u{2028}\u{2029}",
+                "<>&\u{2028}\u{2029}",
+                5,
+                false,
+            ),
             ("zero", "abc", "...3 bytes truncated...", 0, true),
         ];
         for (name, text, want, limit, truncated) in cases {
@@ -352,8 +370,7 @@ mod tests {
     #[test]
     fn archive_writes_bytes_and_hashes_them() {
         let dir = std::env::temp_dir().join(format!("seat-clip-{}", std::process::id()));
-        let result =
-            archive_text("héllo", &dir, "sub", "sess", "out.txt").expect("archive");
+        let result = archive_text("héllo", &dir, "sub", "sess", "out.txt").expect("archive");
         assert_eq!(result.bytes, "héllo".len() as u64);
         assert_eq!(result.sha256, sha256_text("héllo"));
         assert_eq!(std::fs::read(&result.path).unwrap(), "héllo".as_bytes());

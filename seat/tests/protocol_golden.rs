@@ -43,7 +43,29 @@ fn minimal_request() -> SeatRequest {
         session_dir: Some("seats/pkt-1:1".into()),
         fence: vec![],
         protected_roots: vec![],
+        toolgate: Default::default(),
     }
+}
+
+#[test]
+fn seat_request_toolgate_defaults_and_rejects_unknown() {
+    let raw = json!({
+        "v": 1,
+        "request_id": "pkt-1:1",
+        "cwd": "/repo",
+        "model": {"id": "composer-2.5"},
+        "prompt": {"body": "b"},
+        "disallowed_tools": ["task"],
+        "limits": {"context_chars": 1, "timeout_s": 1, "heartbeat_s": 1},
+        "toolgate": {"mode": "add", "gates": ["cargo test -p cursor-seat"]},
+    });
+    let req: SeatRequest = serde_json::from_value(raw).expect("parses");
+    assert_eq!(req.toolgate.mode, cursor_seat::ToolgateMode::Add);
+    assert_eq!(req.toolgate.gates, vec!["cargo test -p cursor-seat"]);
+
+    let mut bad = serde_json::to_value(&req).unwrap();
+    bad["toolgate"]["extra"] = json!(1);
+    assert!(serde_json::from_value::<SeatRequest>(bad).is_err());
 }
 
 #[test]
@@ -223,6 +245,7 @@ fn result_event_covers_the_outcome_table() {
                 reason: "over context_chars".into(),
             }],
             resumed: false,
+            tool_stats: Default::default(),
         };
         let event = SeatEvent {
             seq: 9,

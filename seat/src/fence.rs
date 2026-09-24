@@ -1,7 +1,7 @@
 //! Worktree fence: escape detection, protected-root snapshots, git drift.
 
-use std::collections::BTreeMap;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
 use std::path::{Component, Path, PathBuf};
 
@@ -123,6 +123,9 @@ pub fn tool_escape(
     if is_read_only(&name) {
         return None;
     }
+    if name == "run_bounded" {
+        return run_bounded_escape(args, cwd, allowed_extra, protected_roots);
+    }
     if name == "shell" || name.ends_with("shell") {
         return shell_escape(args, cwd, allowed_extra, protected_roots);
     }
@@ -221,6 +224,76 @@ fn shell_effective_cwd(args: &serde_json::Map<String, Value>, worktree_cwd: &Pat
     resolved_clean(worktree_cwd)
 }
 
+fn run_bounded_escape(
+    args: &serde_json::Map<String, Value>,
+    cwd: &Path,
+    allowed_extra: &[PathBuf],
+    protected_roots: &[PathBuf],
+) -> Option<PathBuf> {
+    if protected_roots.is_empty() {
+        return None;
+    }
+    let program = args
+        .get("program")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim();
+    if program.is_empty() {
+        return None;
+    }
+    let mut parts = vec![program.to_string()];
+    if let Some(list) = args.get("args").and_then(Value::as_array) {
+        for item in list {
+            if let Some(s) = item.as_str() {
+                parts.push(s.to_string());
+            }
+        }
+    }
+    let lexical_base = resolved_clean(cwd);
+    run_argv_protected_escape(&parts, &lexical_base, cwd, allowed_extra, protected_roots)
+}
+
+/// Protected-root check on the argv that `run_bounded` will execute (not a
+/// space-joined shell string).
+fn run_argv_protected_escape(
+    parts: &[String],
+    lexical_base: &Path,
+    worktree_cwd: &Path,
+    allowed_extra: &[PathBuf],
+    protected_roots: &[PathBuf],
+) -> Option<PathBuf> {
+    let mut i = 0;
+    while i < parts.len() {
+        let token = parts[i].trim();
+        if token.eq_ignore_ascii_case("-c") || token.eq_ignore_ascii_case("-lc") {
+            if let Some(script) = parts.get(i + 1) {
+                if let Some(hit) = shell_command_protected_escape(
+                    script,
+                    lexical_base,
+                    worktree_cwd,
+                    allowed_extra,
+                    protected_roots,
+                ) {
+                    return Some(hit);
+                }
+                i += 2;
+                continue;
+            }
+        }
+        for candidate in path_candidates_from_token(token) {
+            if let Some(path) = resolve_shell_candidate_path(&candidate, lexical_base) {
+                if let Some(hit) =
+                    hits_protected_root(&path, protected_roots, worktree_cwd, allowed_extra)
+                {
+                    return Some(hit);
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
 fn shell_escape(
     args: &serde_json::Map<String, Value>,
     cwd: &Path,
@@ -274,8 +347,7 @@ fn shell_command_strings(args: &serde_json::Map<String, Value>) -> Vec<String> {
 }
 
 fn is_unquoted_shell_break(ch: char) -> bool {
-    ch.is_whitespace()
-        || matches!(ch, ';' | '|' | '&' | '<' | '>' | '(' | ')' | '\n' | '`')
+    ch.is_whitespace() || matches!(ch, ';' | '|' | '&' | '<' | '>' | '(' | ')' | '\n' | '`')
 }
 
 /// Split a shell command on whitespace and shell metacharacters; honour quotes and `\`.
@@ -393,10 +465,7 @@ fn path_candidates_from_token(token: &str) -> Vec<String> {
 
 fn is_absolute_or_home_spelling(token: &str) -> bool {
     let t = token.trim();
-    t.starts_with('/')
-        || t.starts_with('~')
-        || t.starts_with("$HOME")
-        || t.starts_with("${HOME}")
+    t.starts_with('/') || t.starts_with('~') || t.starts_with("$HOME") || t.starts_with("${HOME}")
 }
 
 fn is_relative_path_spelling(token: &str) -> bool {
@@ -526,12 +595,9 @@ fn shell_command_protected_escape(
             if let Some((path_token, next)) = next_shell_arg(&tokens, i) {
                 for candidate in path_candidates_from_token(&path_token) {
                     if let Some(path) = resolve_shell_candidate_path(&candidate, &lexical_base) {
-                        if let Some(hit) = hits_protected_root(
-                            &path,
-                            protected_roots,
-                            worktree_cwd,
-                            allowed_extra,
-                        ) {
+                        if let Some(hit) =
+                            hits_protected_root(&path, protected_roots, worktree_cwd, allowed_extra)
+                        {
                             return Some(hit);
                         }
                     }
@@ -618,12 +684,7 @@ fn canonicalize_component(path: &Path) -> PathBuf {
             let resolved = if link.is_absolute() {
                 lexically_normalize(&link)
             } else {
-                lexically_normalize(
-                    &path
-                        .parent()
-                        .unwrap_or(Path::new("/"))
-                        .join(link),
-                )
+                lexically_normalize(&path.parent().unwrap_or(Path::new("/")).join(link))
             };
             if resolved.exists() {
                 return std::fs::canonicalize(&resolved).unwrap_or(resolved);
@@ -699,7 +760,9 @@ fn path_allowed(resolved: &Path, cwd: &Path, allowed_extra: &[PathBuf]) -> bool 
 }
 
 fn path_starts_with(path: &Path, prefix: &Path) -> bool {
-    path.components().zip(prefix.components()).all(|(a, b)| a == b)
+    path.components()
+        .zip(prefix.components())
+        .all(|(a, b)| a == b)
         && path.components().count() >= prefix.components().count()
 }
 
@@ -947,7 +1010,10 @@ fn literal_git_pathspec(toplevel_rel: &str) -> String {
     format!(":(literal){toplevel_rel}")
 }
 
-fn git_status_dirty_rels(root: &Path, rels: &[String]) -> Result<std::collections::HashSet<String>, ()> {
+fn git_status_dirty_rels(
+    root: &Path,
+    rels: &[String],
+) -> Result<std::collections::HashSet<String>, ()> {
     use std::collections::{HashMap, HashSet};
 
     if rels.is_empty() {
@@ -1244,7 +1310,10 @@ mod tests {
     fn tilde_fence_entry_under_cwd_matches() {
         let home = PathBuf::from(std::env::var("HOME").expect("HOME"));
         let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let cwd = home.join(format!(".cursor-seat-fence-tilde-{}-{n}", std::process::id()));
+        let cwd = home.join(format!(
+            ".cursor-seat-fence-tilde-{}-{n}",
+            std::process::id()
+        ));
         let _ = fs::remove_dir_all(&cwd);
         fs::create_dir_all(&cwd).unwrap();
         let file_rel = "marked.txt";
@@ -1864,6 +1933,42 @@ mod tests {
         tool_escape("shell", &shell_args(command), cwd, &[], protected)
     }
 
+    fn run_bounded_hit(
+        program: &str,
+        args: &[&str],
+        cwd: &Path,
+        protected: &[PathBuf],
+    ) -> Option<PathBuf> {
+        let argv: Vec<Value> = args
+            .iter()
+            .map(|s| Value::String((*s).to_string()))
+            .collect();
+        let map = serde_json::json!({"program": program, "args": argv})
+            .as_object()
+            .unwrap()
+            .clone();
+        tool_escape("run_bounded", &map, cwd, &[], protected)
+    }
+
+    #[test]
+    fn run_bounded_writing_into_protected_root_is_caught() {
+        let cwd = unique_temp("run-bounded-cwd");
+        let main = unique_temp("run-bounded-main");
+        fs::create_dir_all(main.join("crates")).unwrap();
+        let src = cwd.join("a.rs");
+        fs::write(&src, b"x").unwrap();
+        assert!(run_bounded_hit(
+            "cp",
+            &[
+                src.to_string_lossy().as_ref(),
+                main.join("crates/evil.rs").to_string_lossy().as_ref(),
+            ],
+            &cwd,
+            &[main],
+        )
+        .is_some());
+    }
+
     #[test]
     fn shell_command_cp_into_protected_root() {
         let cwd = unique_temp("shell-cp-cwd");
@@ -1893,10 +1998,7 @@ mod tests {
         let cwd = unique_temp("shell-git-cwd");
         let main = unique_temp("shell-git-main");
         fs::create_dir_all(main.join("crates/ffi")).unwrap();
-        let cmd = format!(
-            "cd {} && git checkout -- crates/ffi/ffi.rs",
-            main.display()
-        );
+        let cmd = format!("cd {} && git checkout -- crates/ffi/ffi.rs", main.display());
         assert!(shell_hit(&cmd, &cwd, &[main]).is_some());
     }
 
@@ -1922,7 +2024,10 @@ mod tests {
     fn shell_command_home_spelling_variants() {
         let home = PathBuf::from(std::env::var("HOME").expect("HOME"));
         let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let main = home.join(format!("cursor-seat-shell-home-main-{}-{n}", std::process::id()));
+        let main = home.join(format!(
+            "cursor-seat-shell-home-main-{}-{n}",
+            std::process::id()
+        ));
         let _ = fs::remove_dir_all(&main);
         fs::create_dir_all(&main).unwrap();
         let cwd = unique_temp("shell-home-cwd");
@@ -2006,7 +2111,12 @@ mod tests {
         let wt = parent.join("wt");
         fs::create_dir_all(main.join("target")).unwrap();
         fs::create_dir_all(&wt).unwrap();
-        assert!(shell_hit("CARGO_TARGET_DIR=../main/target cargo test", &wt, &[main.clone()]).is_some());
+        assert!(shell_hit(
+            "CARGO_TARGET_DIR=../main/target cargo test",
+            &wt,
+            &[main.clone()]
+        )
+        .is_some());
         assert!(shell_hit("cd ../main && git status", &wt, &[main.clone()]).is_some());
         assert!(shell_hit("cat ../main/x", &wt, &[main]).is_some());
     }
@@ -2054,7 +2164,12 @@ mod tests {
         fs::create_dir_all(wt.join("seat")).unwrap();
         fs::create_dir_all(&primary).unwrap();
         fs::write(primary.join("file"), b"x").unwrap();
-        assert!(shell_hit("cd seat && cp ../../primary/file .", &wt, &[primary.clone()]).is_some());
+        assert!(shell_hit(
+            "cd seat && cp ../../primary/file .",
+            &wt,
+            &[primary.clone()]
+        )
+        .is_some());
         fs::write(wt.join("README.md"), b"r").unwrap();
         let outside = unique_temp("cd-track-other");
         assert!(shell_hit("cd seat && cat ../README.md", &wt, &[outside]).is_none());
