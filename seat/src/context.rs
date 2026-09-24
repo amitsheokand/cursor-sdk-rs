@@ -120,9 +120,7 @@ pub fn format_catalog_note(skills: &[SkillEntry]) -> String {
     if skills.is_empty() {
         return String::new();
     }
-    let mut out = String::with_capacity(
-        SKILL_PREAMBLE.len() + skills.len() * 128,
-    );
+    let mut out = String::with_capacity(SKILL_PREAMBLE.len() + skills.len() * 128);
     out.push_str(SKILL_PREAMBLE);
     out.push_str("\n\n<available_skills>");
     for skill in skills {
@@ -228,6 +226,7 @@ mod tests {
             tools_enabled: vec![],
             skill_roots: vec![],
             jev: Default::default(),
+            toolgate: Default::default(),
             limits: Limits {
                 context_chars: budget,
                 clip_chars: 40_000,
@@ -258,7 +257,9 @@ mod tests {
         assert!(built.text.contains("nudge"));
         assert!(built.text.contains("<available_skills>"));
         assert!(built.text.contains("<name>a</name>"));
-        assert!(built.text.contains("<location>/skills/b/SKILL.md</location>"));
+        assert!(built
+            .text
+            .contains("<location>/skills/b/SKILL.md</location>"));
     }
 
     #[test]
@@ -279,11 +280,9 @@ mod tests {
         let req = request("do it", &body, Some("nudge"), 700);
         let built = build_context(&req, &[skill("a")]);
         // Catalog note alone exceeds the slack, so it drops; steer survives.
-        assert!(
-            built
-                .changes
-                .contains(&omitted("skills.catalog", "over context_chars budget"))
-        );
+        assert!(built
+            .changes
+            .contains(&omitted("skills.catalog", "over context_chars budget")));
         assert!(!built.text.contains("<available_skills>"));
         assert!(built.text.contains("nudge"));
         assert!(built.text.chars().count() <= 700);
@@ -293,12 +292,10 @@ mod tests {
     fn tight_budget_omits_steer_first() {
         let req = request("do it", "body", Some("a much longer steer message"), 40);
         let built = build_context(&req, &[]);
-        assert!(
-            built
-                .changes
-                .iter()
-                .any(|change| change.source == "prompt.steer")
-        );
+        assert!(built
+            .changes
+            .iter()
+            .any(|change| change.source == "prompt.steer"));
         assert!(!built.text.contains("steer message"));
         assert!(built.text.chars().count() <= 40);
     }

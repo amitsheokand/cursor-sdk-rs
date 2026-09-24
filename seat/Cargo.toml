@@ -2,7 +2,7 @@
 name = "cursor-seat"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.82"
+rust-version = "1.85"
 license = "MIT"
 description = "Cursor seat binary: typed stdin inbox, omission-reporting context, durable at-most-once run"
 readme = "../README.md"
@@ -24,6 +24,7 @@ thiserror = "2"
 toml = "0.8"
 tokio = { version = "1", features = ["rt", "macros", "io-util", "io-std", "time", "fs", "sync", "process"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots"] }
+toolgate = { git = "https://github.com/amitsheokand/toolgate", rev = "79b0e8c17abab48bf8d7f54afdbabda72993b9d4", default-features = false }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

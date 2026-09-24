@@ -10,14 +10,14 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
-use std::time::Duration;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use bytes::Bytes;
 use cursor_sdk::proto;
 use futures_util::StreamExt as _;
-use http_body_util::{BodyExt, Full, StreamBody, combinators::BoxBody};
+use http_body_util::{combinators::BoxBody, BodyExt, Full, StreamBody};
 use hyper::body::Frame;
 use hyper::body::Incoming;
 use hyper::service::service_fn;
@@ -260,13 +260,11 @@ async fn handle(state: State, request: Request<Incoming>) -> BoxResponse {
     };
 
     match reply {
-        Some(Reply::Unary(payload)) => {
-            Response::builder()
-                .status(StatusCode::OK)
-                .header(hyper::header::CONTENT_TYPE, "application/proto")
-                .body(Full::new(payload).map_err(|never| match never {}).boxed())
-                .unwrap()
-        }
+        Some(Reply::Unary(payload)) => Response::builder()
+            .status(StatusCode::OK)
+            .header(hyper::header::CONTENT_TYPE, "application/proto")
+            .body(Full::new(payload).map_err(|never| match never {}).boxed())
+            .unwrap(),
         Some(Reply::Error {
             status,
             code,
@@ -282,7 +280,11 @@ async fn handle(state: State, request: Request<Incoming>) -> BoxResponse {
             Response::builder()
                 .status(StatusCode::OK)
                 .header(hyper::header::CONTENT_TYPE, "application/connect+proto")
-                .body(Full::new(Bytes::from(body)).map_err(|never| match never {}).boxed())
+                .body(
+                    Full::new(Bytes::from(body))
+                        .map_err(|never| match never {})
+                        .boxed(),
+                )
                 .unwrap()
         }
         Some(Reply::StreamTimed(steps)) => {
@@ -444,10 +446,7 @@ static WORKSPACE_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// Fresh absolute directory for a seat `cwd` (must exist for validation).
 pub fn workspace_dir() -> PathBuf {
     let n = WORKSPACE_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!(
-        "cursor-seat-ws-{}-{n}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("cursor-seat-ws-{}-{n}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("workspace dir");
     dir

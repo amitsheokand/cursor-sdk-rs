@@ -10,7 +10,7 @@ mod support;
 
 use std::time::Duration;
 
-use cursor_sdk::{AgentOptions, ErrorKind, proto};
+use cursor_sdk::{proto, AgentOptions, ErrorKind};
 use cursor_seat::protocol::Outcome;
 use cursor_seat::retry::{classify, classify_run_status, should_retry_in_seat};
 use hyper::StatusCode;

@@ -50,7 +50,10 @@ pub enum OpState {
 impl OpState {
     /// Whether the attempt is over (re-invoke replays, never sends).
     pub fn is_terminal(self) -> bool {
-        matches!(self, OpState::Completed | OpState::Failed | OpState::Canceled)
+        matches!(
+            self,
+            OpState::Completed | OpState::Failed | OpState::Canceled
+        )
     }
 
     /// Legal transitions. Mostly a strict subset of Go's remote-job
@@ -102,10 +105,7 @@ pub enum Opened {
     /// No usable history: send normally.
     Fresh,
     /// A run is live remotely: attach, never re-send.
-    Resume {
-        run_id: String,
-        agent_id: String,
-    },
+    Resume { run_id: String, agent_id: String },
     /// The attempt already finished: return the stored result.
     Replay,
 }
@@ -183,7 +183,10 @@ impl SessionStore {
             return Ok((store, Opened::Fresh));
         }
         let raw = std::fs::read(&store.path)?;
-        let committed_len = raw.iter().rposition(|byte| *byte == b'\n').map_or(0, |pos| pos + 1);
+        let committed_len = raw
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |pos| pos + 1);
         if committed_len < raw.len() {
             // Torn tail: truncate it away (best-effort; the in-memory
             // image below still loads from the committed prefix).
@@ -200,7 +203,9 @@ impl SessionStore {
         store.load(&raw[..committed_len])?;
         match store.internal_decision() {
             Decision::Fresh => Ok((store, Opened::Fresh)),
-            Decision::Resume { run_id, agent_id } => Ok((store, Opened::Resume { run_id, agent_id })),
+            Decision::Resume { run_id, agent_id } => {
+                Ok((store, Opened::Resume { run_id, agent_id }))
+            }
             Decision::Replay => Ok((store, Opened::Replay)),
             Decision::Broken(error) => Err(error),
         }
@@ -354,10 +359,12 @@ impl SessionStore {
     }
 
     fn load(&mut self, committed: &[u8]) -> Result<(), SessionError> {
-        let text =
-            std::str::from_utf8(committed).map_err(|_| SessionError::Corrupt("log is not UTF-8".to_string()))?;
+        let text = std::str::from_utf8(committed)
+            .map_err(|_| SessionError::Corrupt("log is not UTF-8".to_string()))?;
         let mut lines = text.lines();
-        let first = lines.next().ok_or_else(|| SessionError::Corrupt("log is empty".to_string()))?;
+        let first = lines
+            .next()
+            .ok_or_else(|| SessionError::Corrupt("log is empty".to_string()))?;
         let session: SessionData = record_data(first, "session")?;
         if session.v != SESSION_VERSION {
             return Err(SessionError::Corrupt(format!(
@@ -444,7 +451,9 @@ fn record_data<T: serde::de::DeserializeOwned>(line: &str, kind: &str) -> Result
     if value.get("type").and_then(|type_| type_.as_str()) != Some(kind) {
         return Err(SessionError::Corrupt(format!("expected a {kind} record")));
     }
-    let data = value.get("data").ok_or_else(|| SessionError::Corrupt("record has no data".to_string()))?;
+    let data = value
+        .get("data")
+        .ok_or_else(|| SessionError::Corrupt("record has no data".to_string()))?;
     serde_json::from_value(data.clone()).map_err(SessionError::Json)
 }
 
@@ -486,6 +495,7 @@ mod tests {
             self_check: None,
             context_changes: vec![],
             resumed: false,
+            tool_stats: std::collections::BTreeMap::new(),
         }
     }
 

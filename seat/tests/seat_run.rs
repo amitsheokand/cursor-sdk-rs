@@ -6,13 +6,13 @@
 
 mod support;
 
+use cursor_sdk::proto;
 use cursor_seat::inbox::Inbox;
 use cursor_seat::protocol::{
     ControlInput, ControlKind, ControlMode, Limits, ModelParams, ModelRef, Outcome, PromptPart,
     SeatEvent, SeatEventKind, SeatRequest, SeatResult,
 };
 use cursor_seat::run::run_seat;
-use cursor_sdk::proto;
 use serde_json::json;
 use support::*;
 use tokio::sync::mpsc;
@@ -35,7 +35,7 @@ fn request_with_cwd(
             id: "composer-2.5".into(),
             params: ModelParams {
                 effort: effort.map(str::to_string),
-                                extra: Default::default(),
+                extra: Default::default(),
             },
         },
         prompt: PromptPart {
@@ -49,6 +49,7 @@ fn request_with_cwd(
         tools_enabled: vec![],
         skill_roots: vec![],
         jev: Default::default(),
+        toolgate: Default::default(),
         limits: Limits {
             context_chars: 100_000,
             clip_chars: 40_000,
@@ -302,12 +303,7 @@ async fn hard_cancel_before_run_id_fires_on_run_started() {
                 json!({"run_id": "run_1", "agent_id": "agent_1"}),
                 Some("o1"),
             ),
-            result_frame(
-                "agent_1",
-                "run_1",
-                proto::RunLifecycleStatus::Cancelled,
-                "",
-            ),
+            result_frame("agent_1", "run_1", proto::RunLifecycleStatus::Cancelled, ""),
             done_frame("agent_1", "run_1"),
         ]),
     );
@@ -610,9 +606,6 @@ async fn full_text_is_archived_when_a_session_dir_is_given() {
     let (_, result) = collect(&bridge, request, Inbox::new(&[]).unwrap()).await;
 
     let path = result.archive_path.expect("archive path");
-    assert_eq!(
-        std::fs::read_to_string(&path).unwrap(),
-        "Hello, world."
-    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "Hello, world.");
     std::fs::remove_dir_all(&dir).unwrap();
 }

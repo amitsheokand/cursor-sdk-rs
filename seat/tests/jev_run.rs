@@ -11,13 +11,13 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
+use cursor_sdk::proto;
 use cursor_seat::inbox::Inbox;
 use cursor_seat::protocol::{
     JevConfig, Limits, ModelParams, ModelRef, Outcome, PromptPart, SeatEvent, SeatEventKind,
     SeatRequest, SeatResult,
 };
 use cursor_seat::run::run_seat;
-use cursor_sdk::proto;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
@@ -99,15 +99,9 @@ async fn mock_server(
                                     _ if id.starts_with("tool:") => {
                                         // Prune battery: keep skill_use,
                                         // drop the rest.
-                                        let p = if id.ends_with("skill_use") {
-                                            0.9
-                                        } else {
-                                            0.1
-                                        };
-                                        answers.insert(
-                                            id.clone(),
-                                            json!({"type": "noul", "noul": p}),
-                                        );
+                                        let p = if id.ends_with("skill_use") { 0.9 } else { 0.1 };
+                                        answers
+                                            .insert(id.clone(), json!({"type": "noul", "noul": p}));
                                     }
                                     _ => {}
                                 }
@@ -171,7 +165,7 @@ fn request_with_jev(dir: &PathBuf, turns: u32) -> SeatRequest {
             id: "composer-2.5".into(),
             params: ModelParams {
                 effort: Some("high".into()),
-                                extra: HashMap::new(),
+                extra: HashMap::new(),
             },
         },
         prompt: PromptPart {
@@ -184,6 +178,7 @@ fn request_with_jev(dir: &PathBuf, turns: u32) -> SeatRequest {
         disallowed_tools: vec!["task".into()],
         tools_enabled: vec![],
         skill_roots: vec![],
+        toolgate: Default::default(),
         jev: JevConfig {
             enabled: true,
             questions_dir: Some(dir.display().to_string()),
@@ -240,10 +235,7 @@ fn ok_stream(text: &str) -> Vec<bytes::Bytes> {
     ]
 }
 
-async fn collect(
-    bridge: &FakeBridge,
-    request: SeatRequest,
-) -> (Vec<SeatEvent>, SeatResult) {
+async fn collect(bridge: &FakeBridge, request: SeatRequest) -> (Vec<SeatEvent>, SeatResult) {
     let client = client_for(bridge);
     let inbox = Inbox::new(&[]).unwrap();
     let (tx, mut rx) = mpsc::unbounded_channel();
@@ -342,9 +334,12 @@ async fn self_check_and_triage_flow() {
     assert_eq!(bridge.call_count("SdkAgentService/Send"), 1);
     assert!(*saw_auth.lock().unwrap(), "bearer key sent");
     assert!(*saw_model.lock().unwrap(), "pinned model sent");
-    assert!(events
-        .iter()
-        .all(|e| !matches!(e.kind, SeatEventKind::Jev { .. })), "no triage on ok");
+    assert!(
+        events
+            .iter()
+            .all(|e| !matches!(e.kind, SeatEventKind::Jev { .. })),
+        "no triage on ok"
+    );
 
     // Scenario B: failing self-check sends one same-agent follow-up.
     *p.lock().unwrap() = 0.05;
@@ -415,8 +410,7 @@ async fn self_check_and_triage_flow() {
         "SdkAgentService/CloseAgent",
         Reply::unary(&proto::CloseAgentResponse {}),
     );
-    let (events, result) =
-        collect(&bridge, request_with_jev(&dir, 0)).await;
+    let (events, result) = collect(&bridge, request_with_jev(&dir, 0)).await;
     assert_eq!(result.error_kind.as_deref(), Some("Unknown"));
     let triage = events.iter().find_map(|e| match &e.kind {
         SeatEventKind::Jev { check, verdict, p } => Some((check.clone(), verdict.clone(), *p)),
@@ -428,8 +422,7 @@ async fn self_check_and_triage_flow() {
     );
 
     // Scenario D: trivial task skips the self-check loop (one Send).
-    let trivial_dir =
-        std::env::temp_dir().join(format!("seat-jev-trivial-{}", std::process::id()));
+    let trivial_dir = std::env::temp_dir().join(format!("seat-jev-trivial-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&trivial_dir);
     std::fs::create_dir_all(&trivial_dir).unwrap();
     std::fs::write(
@@ -479,8 +472,7 @@ async fn self_check_and_triage_flow() {
     assert_eq!(bridge.call_count("SdkAgentService/Send"), 1);
 
     // Scenario E: prune_tools declares only the kept tool.
-    let prune_dir =
-        std::env::temp_dir().join(format!("seat-jev-prune-{}", std::process::id()));
+    let prune_dir = std::env::temp_dir().join(format!("seat-jev-prune-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&prune_dir);
     std::fs::create_dir_all(&prune_dir).unwrap();
     std::fs::write(

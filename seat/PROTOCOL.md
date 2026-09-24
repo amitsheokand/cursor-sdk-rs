@@ -23,7 +23,8 @@ non-fast law, forced when the catalog exposes it), `prompt {task, effort_tag, bo
 steer}`, `mcp_servers`, `disallowed_tools` always including `task`,
 `tools_enabled` (empty = unrestricted, CLI-like; non-empty is an
 allowlist with the seat tools unioned in), `skill_roots`, `jev {enabled, questions_dir,
-self_check_turns, prune_tools}`, `limits {context_chars, clip_chars=40000,
+self_check_turns, prune_tools}`, `toolgate {mode: off|add|replace, gates?}` (default
+`off`; `gates` is the trusted gate-command list for `run_gates`), `limits {context_chars, clip_chars=40000,
 timeout_s, heartbeat_s}`, `session_dir`, `fence` (worktree-relative file or
 directory prefix allowlist; default `[]`), `protected_roots` (absolute checkout
 paths that must not change under the fence entries; default `[]`)). Unknown
@@ -115,7 +116,8 @@ violations use `FenceEscape` or `FenceDrift`),
 `agent_id`, `model`, `text` (clipped), `archive_path`, `wall_ms`,
 `ttfe_ms`, `usage`, `attempts` (cumulative pre-start tries across the
 models/create/send phases, not send-retries), `self_check {passed,
-turns, reason?}`, `context_changes`, `resumed`.
+turns, reason?}`, `context_changes`, `resumed`, `tool_stats` (`{tool_name:
+{calls, result_chars}}` for built-in and custom tools).
 
 Tagged `type` uses snake_case (`seat_started`, `context_report`,
 `run_started`, `assistant`, `tool_call`, `usage`, `status`,

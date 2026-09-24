@@ -28,9 +28,13 @@ rustPlatform.buildRustPackage {
       && !(lib.hasSuffix ".md" name && lib.hasPrefix "PACKET" name);
   };
 
-  cargoLock.lockFile = ../Cargo.lock;
+  cargoLock = {
+    lockFile = ../Cargo.lock;
+    outputHashes = {
+      "toolgate-0.1.0" = "sha256-I9v/kCH/e49lKay6MjPfLtY5nwj2yCPiRiwBDn6DtNY=";
+    };
+  };
 
-  # When cursor-seat adds a git dependency on toolgate, add cargoLock.outputHashes.
   cargoBuildFlags = [
     "-p"
     "cursor-seat"

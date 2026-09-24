@@ -8,7 +8,7 @@
 //!
 //! Golden JSON tests in `tests/protocol_golden.rs` pin the wire shape.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 /// Protocol version. `SeatRequest.v` must equal this.
@@ -45,6 +45,8 @@ pub struct SeatRequest {
     pub skill_roots: Vec<String>,
     #[serde(default)]
     pub jev: JevConfig,
+    #[serde(default)]
+    pub toolgate: ToolgateConfig,
     pub limits: Limits,
     /// Directory holding `session.jsonl` for the durable run (P5).
     #[serde(default)]
@@ -139,6 +141,46 @@ pub struct McpServerConfig {
     pub args: Vec<String>,
     #[serde(default)]
     pub url: Option<String>,
+}
+
+/// `toolgate {mode, gates}` — bounded read/edit/run tools (default off).
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolgateConfig {
+    #[serde(default)]
+    pub mode: ToolgateMode,
+    #[serde(default)]
+    pub gates: Vec<String>,
+}
+
+/// `off` (default) | `add` | `replace`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolgateMode {
+    #[default]
+    Off,
+    Add,
+    Replace,
+}
+
+impl ToolgateMode {
+    /// Whether toolgate tools should be registered for this attempt.
+    pub fn is_active(self) -> bool {
+        !matches!(self, ToolgateMode::Off)
+    }
+
+    /// Whether built-in read/edit/write/shell should be disallowed.
+    pub fn is_replace(self) -> bool {
+        matches!(self, ToolgateMode::Replace)
+    }
+}
+
+/// Per-tool call counts and result size for A/B benches.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolStat {
+    pub calls: u64,
+    pub result_chars: u64,
 }
 
 /// `jev {enabled, questions_dir, self_check_turns, prune_tools}`.
@@ -343,6 +385,8 @@ pub struct SeatResult {
     pub context_changes: Vec<ContextChange>,
     #[serde(default)]
     pub resumed: bool,
+    #[serde(default)]
+    pub tool_stats: BTreeMap<String, ToolStat>,
 }
 
 /// `ok|failed|startup_error|busy|bounced|stale`.
@@ -372,10 +416,8 @@ mod tests {
 
     #[test]
     fn request_validation_enforces_task_law() {
-        let dir = std::env::temp_dir().join(format!(
-            "cursor-seat-validate-task-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("cursor-seat-validate-task-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::create_dir_all(&dir);
         let mut req = minimal_request();
@@ -408,6 +450,7 @@ mod tests {
             tools_enabled: vec![],
             skill_roots: vec![],
             jev: JevConfig::default(),
+            toolgate: ToolgateConfig::default(),
             limits: Limits {
                 context_chars: 100_000,
                 clip_chars: 40_000,

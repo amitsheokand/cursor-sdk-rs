@@ -7,12 +7,12 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
+use cursor_sdk::proto;
 use cursor_seat::inbox::Inbox;
 use cursor_seat::protocol::{
     Limits, ModelParams, ModelRef, Outcome, PromptPart, SeatEventKind, SeatRequest, SeatResult,
 };
 use cursor_seat::run::run_seat;
-use cursor_sdk::proto;
 use serde_json::json;
 use support::*;
 use tokio::sync::mpsc;
@@ -40,6 +40,7 @@ fn fenced_request(cwd: PathBuf, fence: Vec<String>, protected_roots: Vec<String>
         tools_enabled: vec![],
         skill_roots: vec![],
         jev: Default::default(),
+        toolgate: Default::default(),
         limits: Limits {
             context_chars: 100_000,
             clip_chars: 40_000,
@@ -190,12 +191,7 @@ async fn edit_outside_cwd_bounces_and_cancels() {
                 }),
                 Some("o2"),
             ),
-            result_frame(
-                "agent_1",
-                "run_1",
-                proto::RunLifecycleStatus::Cancelled,
-                "",
-            ),
+            result_frame("agent_1", "run_1", proto::RunLifecycleStatus::Cancelled, ""),
             done_frame("agent_1", "run_1"),
         ]),
     );
@@ -211,11 +207,9 @@ async fn edit_outside_cwd_bounces_and_cancels() {
     assert_eq!(result.outcome, Outcome::Bounced);
     assert_eq!(result.status, "fence_escape");
     assert_eq!(result.error_kind.as_deref(), Some("FenceEscape"));
-    assert!(
-        events
-            .iter()
-            .any(|e| matches!(&e.kind, SeatEventKind::Fence { kind, .. } if kind == "escape"))
-    );
+    assert!(events
+        .iter()
+        .any(|e| matches!(&e.kind, SeatEventKind::Fence { kind, .. } if kind == "escape")));
 }
 
 #[tokio::test]
@@ -247,12 +241,7 @@ async fn shell_command_into_protected_root_bounces_and_cancels() {
                 }),
                 Some("o2"),
             ),
-            result_frame(
-                "agent_1",
-                "run_1",
-                proto::RunLifecycleStatus::Cancelled,
-                "",
-            ),
+            result_frame("agent_1", "run_1", proto::RunLifecycleStatus::Cancelled, ""),
             done_frame("agent_1", "run_1"),
         ]),
     );
@@ -297,12 +286,7 @@ async fn shell_cwd_outside_bounces_and_cancels() {
                 }),
                 Some("o2"),
             ),
-            result_frame(
-                "agent_1",
-                "run_1",
-                proto::RunLifecycleStatus::Cancelled,
-                "",
-            ),
+            result_frame("agent_1", "run_1", proto::RunLifecycleStatus::Cancelled, ""),
             done_frame("agent_1", "run_1"),
         ]),
     );
@@ -421,12 +405,7 @@ async fn tool_call_completion_runs_protected_snapshot_when_due() {
         ),
         (
             Duration::ZERO,
-            result_frame(
-                "agent_1",
-                "run_1",
-                proto::RunLifecycleStatus::Cancelled,
-                "",
-            ),
+            result_frame("agent_1", "run_1", proto::RunLifecycleStatus::Cancelled, ""),
         ),
         (Duration::ZERO, done_frame("agent_1", "run_1")),
     ];
@@ -553,12 +532,7 @@ async fn protected_root_midrun_escape_after_tool_call() {
     timed.extend((0..32).map(|_| (Duration::ZERO, keepalive_frame())));
     timed.push((
         Duration::ZERO,
-        result_frame(
-            "agent_1",
-            "run_1",
-            proto::RunLifecycleStatus::Cancelled,
-            "",
-        ),
+        result_frame("agent_1", "run_1", proto::RunLifecycleStatus::Cancelled, ""),
     ));
     timed.push((Duration::ZERO, done_frame("agent_1", "run_1")));
     bridge.expect("SdkAgentService/Send", Reply::StreamTimed(timed));
@@ -646,12 +620,7 @@ async fn shell_nested_working_directory_into_root_bounces() {
                 }),
                 Some("o2"),
             ),
-            result_frame(
-                "agent_1",
-                "run_1",
-                proto::RunLifecycleStatus::Cancelled,
-                "",
-            ),
+            result_frame("agent_1", "run_1", proto::RunLifecycleStatus::Cancelled, ""),
             done_frame("agent_1", "run_1"),
         ]),
     );
@@ -701,12 +670,7 @@ async fn shell_relative_command_into_protected_root_bounces() {
                 }),
                 Some("o2"),
             ),
-            result_frame(
-                "agent_1",
-                "run_1",
-                proto::RunLifecycleStatus::Cancelled,
-                "",
-            ),
+            result_frame("agent_1", "run_1", proto::RunLifecycleStatus::Cancelled, ""),
             done_frame("agent_1", "run_1"),
         ]),
     );
@@ -749,12 +713,7 @@ async fn shell_quoted_space_root_name_bounces() {
                 }),
                 Some("o2"),
             ),
-            result_frame(
-                "agent_1",
-                "run_1",
-                proto::RunLifecycleStatus::Cancelled,
-                "",
-            ),
+            result_frame("agent_1", "run_1", proto::RunLifecycleStatus::Cancelled, ""),
             done_frame("agent_1", "run_1"),
         ]),
     );
@@ -797,12 +756,7 @@ async fn shell_path_colon_field_into_root_bounces() {
                 }),
                 Some("o2"),
             ),
-            result_frame(
-                "agent_1",
-                "run_1",
-                proto::RunLifecycleStatus::Cancelled,
-                "",
-            ),
+            result_frame("agent_1", "run_1", proto::RunLifecycleStatus::Cancelled, ""),
             done_frame("agent_1", "run_1"),
         ]),
     );
@@ -844,14 +798,12 @@ async fn fence_escape_latch_single_cancel_and_event() {
         ),
     ];
     stream_frames.extend((0..96).map(|_| keepalive_frame()));
-    stream_frames.push(
-        result_frame(
-            "agent_1",
-            "run_1",
-            proto::RunLifecycleStatus::Cancelled,
-            "",
-        ),
-    );
+    stream_frames.push(result_frame(
+        "agent_1",
+        "run_1",
+        proto::RunLifecycleStatus::Cancelled,
+        "",
+    ));
     stream_frames.push(done_frame("agent_1", "run_1"));
     bridge.expect("SdkAgentService/Send", Reply::Stream(stream_frames));
     bridge.always(
@@ -1095,12 +1047,7 @@ async fn protected_root_external_then_agent_copy_escapes() {
     timed.extend((0..32).map(|_| (Duration::ZERO, keepalive_frame())));
     timed.push((
         Duration::from_millis(2200),
-        result_frame(
-            "agent_1",
-            "run_1",
-            proto::RunLifecycleStatus::Cancelled,
-            "",
-        ),
+        result_frame("agent_1", "run_1", proto::RunLifecycleStatus::Cancelled, ""),
     ));
     timed.push((Duration::ZERO, done_frame("agent_1", "run_1")));
     bridge.expect("SdkAgentService/Send", Reply::StreamTimed(timed));
@@ -1284,13 +1231,11 @@ async fn out_of_fence_git_drift_gets_one_correction_then_fails() {
     let req = fenced_request(cwd, vec!["in_fence.txt".into()], vec![]);
     let (events, result) = collect(&bridge, req).await;
 
-    assert!(
-        events.iter().any(|event| matches!(
-            &event.kind,
-            SeatEventKind::Fence { kind, path, .. }
-                if kind == "drift" && path == "outside.txt"
-        ))
-    );
+    assert!(events.iter().any(|event| matches!(
+        &event.kind,
+        SeatEventKind::Fence { kind, path, .. }
+            if kind == "drift" && path == "outside.txt"
+    )));
     assert_eq!(bridge.call_count("SdkAgentService/Send"), 2);
     assert_eq!(result.outcome, Outcome::Failed);
     assert_eq!(result.status, "fence_drift");
@@ -1347,7 +1292,10 @@ async fn dotdot_edit_outside_newfile_bounces_and_cancels() {
     let outside = workspace_dir();
     let bridge = FakeBridge::start().await;
     script_models_create_close(&bridge);
-    let escape_path = format!("../{}/evil.txt", outside.file_name().unwrap().to_string_lossy());
+    let escape_path = format!(
+        "../{}/evil.txt",
+        outside.file_name().unwrap().to_string_lossy()
+    );
     bridge.expect(
         "SdkAgentService/Send",
         Reply::Stream(vec![
@@ -1366,12 +1314,7 @@ async fn dotdot_edit_outside_newfile_bounces_and_cancels() {
                 }),
                 Some("o2"),
             ),
-            result_frame(
-                "agent_1",
-                "run_1",
-                proto::RunLifecycleStatus::Cancelled,
-                "",
-            ),
+            result_frame("agent_1", "run_1", proto::RunLifecycleStatus::Cancelled, ""),
             done_frame("agent_1", "run_1"),
         ]),
     );
@@ -1411,12 +1354,7 @@ async fn edit_under_symlink_outside_bounces() {
                 }),
                 Some("o2"),
             ),
-            result_frame(
-                "agent_1",
-                "run_1",
-                proto::RunLifecycleStatus::Cancelled,
-                "",
-            ),
+            result_frame("agent_1", "run_1", proto::RunLifecycleStatus::Cancelled, ""),
             done_frame("agent_1", "run_1"),
         ]),
     );
@@ -1430,7 +1368,7 @@ async fn edit_under_symlink_outside_bounces() {
 
 #[tokio::test]
 async fn attach_resume_drift_correction_then_fence_drift() {
-    use cursor_seat::session::{Opened, OpState, SessionStore};
+    use cursor_seat::session::{OpState, Opened, SessionStore};
 
     let cwd = workspace_dir();
     init_git_repo(&cwd);
@@ -1601,7 +1539,7 @@ async fn protected_root_git_failure_post_drive_emits_undecided() {
 
 #[tokio::test]
 async fn attach_protected_baseline_only_reports_post_attach_changes() {
-    use cursor_seat::session::{Opened, OpState, SessionStore};
+    use cursor_seat::session::{OpState, Opened, SessionStore};
 
     let cwd = workspace_dir();
     let protected = workspace_dir();
@@ -1635,7 +1573,10 @@ async fn attach_protected_baseline_only_reports_post_attach_changes() {
         ),
     ));
     attach_stream.push((Duration::ZERO, done_frame("agent_a", "run_a")));
-    bridge.expect("SdkAgentService/ObserveRun", Reply::StreamTimed(attach_stream));
+    bridge.expect(
+        "SdkAgentService/ObserveRun",
+        Reply::StreamTimed(attach_stream),
+    );
 
     let mut req = fenced_request(
         cwd,
@@ -1690,12 +1631,10 @@ async fn attach_protected_baseline_only_reports_post_attach_changes() {
     assert!(post_written);
     assert_eq!(result.outcome, Outcome::Ok);
     assert_eq!(fence_kind_count(&events, "external"), 1);
-    assert!(
-        events.iter().any(|e| matches!(
-            &e.kind,
-            SeatEventKind::Fence { path, .. } if path.contains("mirror.txt")
-        ))
-    );
+    assert!(events.iter().any(|e| matches!(
+        &e.kind,
+        SeatEventKind::Fence { path, .. } if path.contains("mirror.txt")
+    )));
 }
 
 #[test]
