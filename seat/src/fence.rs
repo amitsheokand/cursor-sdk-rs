@@ -2065,8 +2065,8 @@ mod tests {
         let root = unique_temp("shell-prefix-root");
         let sibling = unique_temp("shell-prefix-sibling");
         let name = root.file_name().unwrap().to_string_lossy();
-        let docs = sibling.parent().unwrap().join(format!("{name}-docs"));
-        let _ = fs::remove_dir_all(&docs);
+        let docs_path = sibling.parent().unwrap().join(format!("{name}-docs"));
+        let docs = TestDir::hold(docs_path);
         fs::create_dir_all(&docs).unwrap();
         let cmd = format!("cat {}/x", docs.display());
         assert!(shell_hit(&cmd, &cwd, &[root]).is_none());

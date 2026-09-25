@@ -51,3 +51,21 @@ impl AsRef<Path> for TestDir {
         &self.0
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static DROP_TEST_N: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn drop_removes_directory() {
+        let n = DROP_TEST_N.fetch_add(1, Ordering::Relaxed);
+        let dir = TestDir::fresh_in_temp("seat-test-dir-drop", n);
+        let path = dir.to_path_buf();
+        assert!(path.is_dir());
+        drop(dir);
+        assert!(!path.exists(), "TestDir::drop must remove the directory");
+    }
+}

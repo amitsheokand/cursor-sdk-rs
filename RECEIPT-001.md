@@ -39,3 +39,35 @@ test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 ```
 (clean — no diff)
 ```
+
+## Grok review round 2
+
+Fixes (all inside PACKET fence):
+
+- `fence.rs` — `shell_command_prefix_not_string_substring`: `{name}-docs` held in `TestDir::hold` so it is removed on drop/panic.
+- `jev.rs` — `bad_configs_fail`: `remove_dir_all` + `create_dir_all` between cases so the empty-dir assert does not see leftover `1.toml` / `2.toml`.
+- `test_dir.rs` — `drop_removes_directory`: fails if `Drop` stops calling `remove_dir_all`.
+
+### Leak check (round 2)
+
+```
+before=257 after=259
+```
+
+`after` exceeds `before` by 2 (same pattern as round 1: nix wrapper dirs under `/tmp`, not `cursor-seat-*` / `fence-*` / `shell-*` test trees).
+
+### Gates (round 2, last lines)
+
+`nix develop -c cargo test -q -p cursor-seat`:
+
+```
+test result: ok. 110 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.79s
+```
+
+(integration suites: 24 + 1 + 8 + 11 + 10 + 3 + 11 passed; doc tests 0)
+
+`nix develop -c cargo fmt --check`:
+
+```
+(clean — no diff)
+```
