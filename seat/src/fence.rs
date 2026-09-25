@@ -2064,12 +2064,18 @@ mod tests {
         let cwd = unique_temp("shell-prefix-cwd");
         let root = unique_temp("shell-prefix-root");
         let sibling = unique_temp("shell-prefix-sibling");
-        let name = root.file_name().unwrap().to_string_lossy();
+        let name = root.file_name().unwrap().to_string_lossy().into_owned();
         let docs_path = sibling.parent().unwrap().join(format!("{name}-docs"));
-        let docs = TestDir::hold(docs_path);
-        fs::create_dir_all(&docs).unwrap();
-        let cmd = format!("cat {}/x", docs.display());
-        assert!(shell_hit(&cmd, &cwd, &[root]).is_none());
+        {
+            let docs = TestDir::hold(docs_path.clone());
+            fs::create_dir_all(&docs).unwrap();
+            let cmd = format!("cat {}/x", docs.display());
+            assert!(shell_hit(&cmd, &cwd, &[root]).is_none());
+        }
+        assert!(
+            !docs_path.exists(),
+            "{name}-docs must be removed when its TestDir drops"
+        );
     }
 
     #[cfg(unix)]

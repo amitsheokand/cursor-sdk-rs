@@ -1244,16 +1244,25 @@ mod tests {
         // Duplicate id across files.
         write_toml(&dir, "1.toml", "[question.a]\ntype = \"noul\"\ninstructions = \"x\"\ncriteria_true = \"y\"\ncriteria_false = \"n\"\n");
         write_toml(&dir, "2.toml", "[question.a]\ntype = \"noul\"\ninstructions = \"x\"\ncriteria_true = \"y\"\ncriteria_false = \"n\"\n");
-        assert!(load_questions(&dir).is_err());
+        assert!(matches!(
+            load_questions(&dir),
+            Err(JevError::Config(msg)) if msg.contains("duplicate question")
+        ));
         // Unknown top-level table.
         std::fs::remove_dir_all(&dir).unwrap();
         std::fs::create_dir_all(&dir).unwrap();
         write_toml(&dir, "1.toml", "[bogus]\nx = 1\n");
-        assert!(load_questions(&dir).is_err());
+        assert!(matches!(
+            load_questions(&dir),
+            Err(JevError::Config(msg)) if msg.contains("unknown table `bogus`")
+        ));
         // Empty dir.
         std::fs::remove_dir_all(&dir).unwrap();
         std::fs::create_dir_all(&dir).unwrap();
-        assert!(load_questions(&dir).is_err());
+        assert!(matches!(
+            load_questions(&dir),
+            Err(JevError::Config(msg)) if msg.contains("no .toml questions")
+        ));
     }
 
     #[test]
