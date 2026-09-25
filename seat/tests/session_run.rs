@@ -7,7 +7,7 @@
 
 mod support;
 
-use std::path::PathBuf;
+use std::path::Path;
 
 use cursor_sdk::proto;
 use cursor_seat::inbox::Inbox;
@@ -21,11 +21,11 @@ use serde_json::json;
 use support::*;
 use tokio::sync::mpsc;
 
-fn request_with_session(dir: &PathBuf) -> SeatRequest {
+fn request_with_session(session_dir: &Path, cwd: &Path) -> SeatRequest {
     SeatRequest {
         v: 1,
         request_id: "pkt-9:1".into(),
-        cwd: workspace_dir().to_string_lossy().into_owned(),
+        cwd: cwd.to_string_lossy().into_owned(),
         model: ModelRef {
             id: "composer-2.5".into(),
             params: ModelParams {
@@ -51,7 +51,7 @@ fn request_with_session(dir: &PathBuf) -> SeatRequest {
             timeout_s: 600,
             heartbeat_s: 30,
         },
-        session_dir: Some(dir.display().to_string()),
+        session_dir: Some(session_dir.display().to_string()),
         fence: vec![],
         protected_roots: vec![],
     }
@@ -76,7 +76,7 @@ fn composer_model() -> proto::SdkModel {
 async fn invoke(
     client: &cursor_sdk::Client,
     request: SeatRequest,
-    dir: &PathBuf,
+    dir: &Path,
 ) -> (Vec<SeatEvent>, SeatResult) {
     // Mirrors main.rs: open the store, seed the inbox, run.
     let (store, _) = SessionStore::open(dir, &request.request_id).unwrap();
@@ -122,16 +122,16 @@ fn event_types(events: &[SeatEvent]) -> Vec<String> {
         .collect()
 }
 
-fn tempdir(name: &str) -> PathBuf {
+fn tempdir(name: &str) -> TestDir {
     let dir = std::env::temp_dir().join(format!("seat-p5-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    dir
+    TestDir::hold(dir)
 }
 
 #[tokio::test]
 async fn terminal_result_replays_with_no_bridge_contact() {
     let dir = tempdir("replay");
-    let request = request_with_session(&dir);
+    let ws = workspace_dir();
+    let request = request_with_session(&dir, &ws);
 
     // First invocation: pre-start busy, recorded as terminal.
     let bridge = FakeBridge::start().await;
@@ -186,12 +186,12 @@ async fn terminal_result_replays_with_no_bridge_contact() {
     assert_eq!(second.request_id, first.request_id);
     assert_eq!(second.attempts, first.attempts);
     assert_eq!(second.text, first.text);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
 async fn live_run_attaches_instead_of_resending() {
     let dir = tempdir("resume");
+    let ws = workspace_dir();
     // Simulate a sender that opened the stream then died: awaiting + run
     // identity, no result.
     let (mut store, opened) = SessionStore::open(&dir, "pkt-9:1").unwrap();
@@ -223,7 +223,8 @@ async fn live_run_attaches_instead_of_resending() {
         ]),
     );
 
-    let (events, result) = invoke(&client_for(&bridge), request_with_session(&dir), &dir).await;
+    let (events, result) =
+        invoke(&client_for(&bridge), request_with_session(&dir, &ws), &dir).await;
 
     assert_eq!(bridge.call_count("SdkAgentService/Send"), 0);
     assert_eq!(bridge.call_count("SdkAgentService/CreateAgent"), 0);
@@ -247,12 +248,12 @@ async fn live_run_attaches_instead_of_resending() {
     let (store, opened) = SessionStore::open(&dir, "pkt-9:1").unwrap();
     assert_eq!(opened, Opened::Replay);
     assert_eq!(store.stored_result().unwrap().text, "Hi");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
 async fn ready_session_sends_normally_and_records() {
     let dir = tempdir("fresh");
+    let ws = workspace_dir();
     // Open (session record only) then run: op is Ready, so this sends.
     let (store, opened) = SessionStore::open(&dir, "pkt-9:1").unwrap();
     assert_eq!(opened, Opened::Fresh);
@@ -294,11 +295,10 @@ async fn ready_session_sends_normally_and_records() {
         Reply::unary(&proto::CloseAgentResponse {}),
     );
 
-    let (_, result) = invoke(&client_for(&bridge), request_with_session(&dir), &dir).await;
+    let (_, result) = invoke(&client_for(&bridge), request_with_session(&dir, &ws), &dir).await;
     assert_eq!(result.outcome, Outcome::Ok);
 
     let (store, opened) = SessionStore::open(&dir, "pkt-9:1").unwrap();
     assert_eq!(opened, Opened::Replay);
     assert_eq!(store.stored_result().unwrap().outcome, Outcome::Ok);
-    let _ = std::fs::remove_dir_all(&dir);
 }

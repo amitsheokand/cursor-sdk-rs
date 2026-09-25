@@ -375,9 +375,8 @@ mod tests {
 
     #[tokio::test]
     async fn run_gates_stops_at_first_failure_and_clips() {
-        let dir = std::env::temp_dir().join(format!("tg-gates-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
+        use crate::test_dir::TestDir;
+        let dir = TestDir::fresh_in_temp("tg-gates", std::process::id() as u64);
         let ctx = ctx(&dir);
         let out = invoke_tool_blocking(&ctx, TOOL_RUN_GATES, json!({})).await;
         let gates = out["gates"].as_array().expect("gates array");
@@ -434,9 +433,8 @@ mod tests {
 
     #[tokio::test]
     async fn edit_diff_rejects_outside_fence() {
-        let dir = std::env::temp_dir().join(format!("tg-fence-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
+        use crate::test_dir::TestDir;
+        let dir = TestDir::fresh_in_temp("tg-fence", std::process::id() as u64);
         fs::write(dir.join("allowed.txt"), "a").unwrap();
         fs::write(dir.join("other.txt"), "a").unwrap();
         let ctx = ctx(&dir);
@@ -454,6 +452,5 @@ mod tests {
         )
         .await;
         assert!(ok.get("error").is_none());
-        let _ = fs::remove_dir_all(&dir);
     }
 }

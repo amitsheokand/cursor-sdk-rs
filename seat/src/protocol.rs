@@ -413,13 +413,11 @@ pub struct SelfCheck {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_dir::TestDir;
 
     #[test]
     fn request_validation_enforces_task_law() {
-        let dir =
-            std::env::temp_dir().join(format!("cursor-seat-validate-task-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::create_dir_all(&dir);
+        let dir = TestDir::fresh_in_temp("cursor-seat-validate-task", 0);
         let mut req = minimal_request();
         req.cwd = dir.to_string_lossy().into_owned();
         assert!(req.validate().is_ok());

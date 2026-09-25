@@ -9,7 +9,8 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::path::PathBuf;
+use std::ops::Deref;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -443,11 +444,55 @@ pub fn client_for(bridge: &FakeBridge) -> cursor_sdk::Client {
 
 static WORKSPACE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Removes a test-created directory when dropped (errors ignored).
+pub struct TestDir(PathBuf);
+
+impl TestDir {
+    /// Clears any stale path, then removes it on drop (caller creates contents).
+    pub fn hold(path: PathBuf) -> Self {
+        let _ = std::fs::remove_dir_all(&path);
+        Self(path)
+    }
+
+    /// Path already prepared on disk; removed on drop only.
+    pub fn from_existing(path: PathBuf) -> Self {
+        Self(path)
+    }
+
+    fn fresh_workspace(n: u64) -> Self {
+        let dir = std::env::temp_dir().join(format!("cursor-seat-ws-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("workspace dir");
+        Self(dir)
+    }
+
+    pub fn to_path_buf(&self) -> PathBuf {
+        self.0.clone()
+    }
+}
+
+impl Drop for TestDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+impl Deref for TestDir {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl AsRef<Path> for TestDir {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
+
 /// Fresh absolute directory for a seat `cwd` (must exist for validation).
-pub fn workspace_dir() -> PathBuf {
+pub fn workspace_dir() -> TestDir {
     let n = WORKSPACE_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("cursor-seat-ws-{}-{n}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("workspace dir");
-    dir
+    TestDir::fresh_workspace(n)
 }

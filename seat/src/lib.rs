@@ -15,4 +15,7 @@ pub mod run;
 pub mod session;
 pub mod toolgate;
 
+#[cfg(test)]
+pub mod test_dir;
+
 pub use protocol::*;

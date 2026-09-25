@@ -1059,15 +1059,14 @@ pub async fn register_tools(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_dir::TestDir;
 
     fn write_toml(dir: &Path, name: &str, body: &str) {
         std::fs::write(dir.join(name), body).unwrap();
     }
 
-    fn sample_dir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("seat-jev-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+    fn sample_dir() -> TestDir {
+        let dir = TestDir::fresh_in_temp("seat-jev", std::process::id() as u64);
         write_toml(
             &dir,
             "a.toml",
@@ -1108,14 +1107,11 @@ mod tests {
         let api = relation.to_api_json();
         assert_eq!(api["criteria"]["supports"], serde_json::json!("states it"));
         assert_eq!(set.thresholds["is_urgent_at"], 0.8);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn options_array_uses_key_before_colon() {
-        let dir = std::env::temp_dir().join(format!("seat-jev-opt-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = TestDir::fresh_in_temp("seat-jev-opt", std::process::id() as u64);
         write_toml(
             &dir,
             "t.toml",
@@ -1135,7 +1131,6 @@ mod tests {
             api["criteria"]["flake"],
             serde_json::json!("flake: transient.")
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1151,9 +1146,7 @@ mod tests {
 
     #[test]
     fn select_template_renders_per_tool() {
-        let dir = std::env::temp_dir().join(format!("seat-jev-sel-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = TestDir::fresh_in_temp("seat-jev-sel", std::process::id() as u64);
         std::fs::write(
             dir.join("tools.toml"),
             "[question.select_tools]\n\
@@ -1180,7 +1173,6 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("`a`"));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1228,9 +1220,7 @@ mod tests {
 
     #[test]
     fn thresholds_come_from_toml_with_fallback() {
-        let dir = std::env::temp_dir().join(format!("seat-jev-thr-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = TestDir::fresh_in_temp("seat-jev-thr", std::process::id() as u64);
         std::fs::write(
             dir.join("q.toml"),
             "[question.receipt_supported]\n\
@@ -1246,35 +1236,38 @@ mod tests {
         let set = load_questions(&dir).unwrap();
         assert_eq!(threshold_for(&set, "receipt_supported", 0.5), 0.8);
         assert_eq!(threshold_for(&set, "missing", 0.5), 0.5);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn bad_configs_fail() {
-        let dir = std::env::temp_dir().join(format!("seat-jev-bad-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = TestDir::fresh_in_temp("seat-jev-bad", std::process::id() as u64);
         // Duplicate id across files.
         write_toml(&dir, "1.toml", "[question.a]\ntype = \"noul\"\ninstructions = \"x\"\ncriteria_true = \"y\"\ncriteria_false = \"n\"\n");
         write_toml(&dir, "2.toml", "[question.a]\ntype = \"noul\"\ninstructions = \"x\"\ncriteria_true = \"y\"\ncriteria_false = \"n\"\n");
-        assert!(load_questions(&dir).is_err());
-        let _ = std::fs::remove_dir_all(&dir);
+        assert!(matches!(
+            load_questions(&dir),
+            Err(JevError::Config(msg)) if msg.contains("duplicate question")
+        ));
         // Unknown top-level table.
+        std::fs::remove_dir_all(&dir).unwrap();
         std::fs::create_dir_all(&dir).unwrap();
         write_toml(&dir, "1.toml", "[bogus]\nx = 1\n");
-        assert!(load_questions(&dir).is_err());
-        let _ = std::fs::remove_dir_all(&dir);
+        assert!(matches!(
+            load_questions(&dir),
+            Err(JevError::Config(msg)) if msg.contains("unknown table `bogus`")
+        ));
         // Empty dir.
+        std::fs::remove_dir_all(&dir).unwrap();
         std::fs::create_dir_all(&dir).unwrap();
-        assert!(load_questions(&dir).is_err());
-        let _ = std::fs::remove_dir_all(&dir);
+        assert!(matches!(
+            load_questions(&dir),
+            Err(JevError::Config(msg)) if msg.contains("no .toml questions")
+        ));
     }
 
     #[test]
     fn key_file_parsing_mirrors_keys_py() {
-        let dir = std::env::temp_dir().join(format!("seat-jev-key-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = TestDir::fresh_in_temp("seat-jev-key", std::process::id() as u64);
         let path = dir.join("typesafe.env");
         std::fs::write(
             &path,
@@ -1292,7 +1285,6 @@ mod tests {
                 Err(JevError::BadKeyMode(_))
             ));
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1335,8 +1327,7 @@ mod tests {
 
     #[tokio::test]
     async fn skill_use_reads_only_on_call() {
-        let dir = std::env::temp_dir().join(format!("seat-skills-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = TestDir::fresh_in_temp("seat-skills", std::process::id() as u64);
         std::fs::create_dir_all(dir.join("deploy")).unwrap();
         std::fs::write(dir.join("deploy").join("SKILL.md"), "# deploy\n").unwrap();
         let tools = SeatTools {
@@ -1358,7 +1349,6 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("not configured"));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

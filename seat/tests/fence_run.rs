@@ -3,7 +3,7 @@
 mod support;
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
@@ -17,7 +17,7 @@ use serde_json::json;
 use support::*;
 use tokio::sync::mpsc;
 
-fn fenced_request(cwd: PathBuf, fence: Vec<String>, protected_roots: Vec<String>) -> SeatRequest {
+fn fenced_request(cwd: &Path, fence: Vec<String>, protected_roots: Vec<String>) -> SeatRequest {
     SeatRequest {
         v: 1,
         request_id: "pkt-fence:1".into(),
@@ -117,7 +117,7 @@ async fn collect(
     (events, result.unwrap_or(returned))
 }
 
-fn init_git_repo(dir: &PathBuf) {
+fn init_git_repo(dir: &Path) {
     Command::new("git")
         .args(["init"])
         .current_dir(dir)
@@ -136,7 +136,7 @@ fn init_git_repo(dir: &PathBuf) {
 }
 
 /// Commits `rel` at HEAD in `cwd`, then leaves the worktree file at `agent_bytes`.
-fn init_protected_fence_git(protected: &PathBuf, rel: &str, committed: &[u8]) {
+fn init_protected_fence_git(protected: &Path, rel: &str, committed: &[u8]) {
     init_git_repo(protected);
     fs::write(protected.join(rel), committed).unwrap();
     Command::new("git")
@@ -151,7 +151,7 @@ fn init_protected_fence_git(protected: &PathBuf, rel: &str, committed: &[u8]) {
         .expect("git commit");
 }
 
-fn git_head_then_agent_edit(cwd: &PathBuf, rel: &str, head_bytes: &[u8], agent_bytes: &[u8]) {
+fn git_head_then_agent_edit(cwd: &Path, rel: &str, head_bytes: &[u8], agent_bytes: &[u8]) {
     init_git_repo(cwd);
     fs::write(cwd.join(rel), head_bytes).unwrap();
     Command::new("git")
@@ -200,7 +200,7 @@ async fn edit_outside_cwd_bounces_and_cancels() {
         Reply::unary(&proto::CancelRunResponse {}),
     );
 
-    let req = fenced_request(cwd, vec!["src".into()], vec![]);
+    let req = fenced_request(&cwd, vec!["src".into()], vec![]);
     let (events, result) = collect(&bridge, req).await;
 
     assert_eq!(bridge.call_count("SdkAgentService/CancelRun"), 1);
@@ -251,7 +251,7 @@ async fn shell_command_into_protected_root_bounces_and_cancels() {
     );
 
     let req = fenced_request(
-        cwd,
+        &cwd,
         vec!["crates".into()],
         vec![protected.to_string_lossy().into_owned()],
     );
@@ -295,7 +295,7 @@ async fn shell_cwd_outside_bounces_and_cancels() {
         Reply::unary(&proto::CancelRunResponse {}),
     );
 
-    let req = fenced_request(cwd, vec!["src".into()], vec![]);
+    let req = fenced_request(&cwd, vec!["src".into()], vec![]);
     let (_, result) = collect(&bridge, req).await;
 
     assert_eq!(bridge.call_count("SdkAgentService/CancelRun"), 1);
@@ -347,7 +347,7 @@ async fn tool_call_started_and_completed_both_emit() {
         ]),
     );
     fs::write(cwd.join("in.txt"), b"ok").unwrap();
-    let req = fenced_request(cwd, vec!["in.txt".into()], vec![]);
+    let req = fenced_request(&cwd, vec!["in.txt".into()], vec![]);
     let (events, result) = collect(&bridge, req).await;
     let tool_calls = events
         .iter()
@@ -416,7 +416,7 @@ async fn tool_call_completion_runs_protected_snapshot_when_due() {
     );
 
     let mut req = fenced_request(
-        cwd.clone(),
+        &cwd,
         vec!["mirror.txt".into()],
         vec![protected.to_string_lossy().into_owned()],
     );
@@ -490,7 +490,7 @@ async fn read_outside_cwd_is_allowed() {
         ]),
     );
 
-    let req = fenced_request(cwd, vec!["src".into()], vec![]);
+    let req = fenced_request(&cwd, vec!["src".into()], vec![]);
     let (_, result) = collect(&bridge, req).await;
 
     assert_eq!(result.outcome, Outcome::Ok);
@@ -542,7 +542,7 @@ async fn protected_root_midrun_escape_after_tool_call() {
     );
 
     let mut req = fenced_request(
-        cwd.clone(),
+        &cwd,
         vec!["mirror.txt".into()],
         vec![protected.to_string_lossy().into_owned()],
     );
@@ -629,7 +629,7 @@ async fn shell_nested_working_directory_into_root_bounces() {
         Reply::unary(&proto::CancelRunResponse {}),
     );
     let req = fenced_request(
-        cwd,
+        &cwd,
         vec!["src".into()],
         vec![protected.to_string_lossy().into_owned()],
     );
@@ -679,7 +679,7 @@ async fn shell_relative_command_into_protected_root_bounces() {
         Reply::unary(&proto::CancelRunResponse {}),
     );
     let req = fenced_request(
-        cwd,
+        &cwd,
         vec!["src".into()],
         vec![protected.to_string_lossy().into_owned()],
     );
@@ -690,7 +690,8 @@ async fn shell_relative_command_into_protected_root_bounces() {
 #[tokio::test]
 async fn shell_quoted_space_root_name_bounces() {
     let cwd = workspace_dir();
-    let protected = workspace_dir().join("my root");
+    let protected_base = workspace_dir();
+    let protected = protected_base.join("my root");
     fs::create_dir_all(&protected).unwrap();
     let bridge = FakeBridge::start().await;
     script_models_create_close(&bridge);
@@ -722,7 +723,7 @@ async fn shell_quoted_space_root_name_bounces() {
         Reply::unary(&proto::CancelRunResponse {}),
     );
     let req = fenced_request(
-        cwd,
+        &cwd,
         vec!["src".into()],
         vec![protected.to_string_lossy().into_owned()],
     );
@@ -765,7 +766,7 @@ async fn shell_path_colon_field_into_root_bounces() {
         Reply::unary(&proto::CancelRunResponse {}),
     );
     let req = fenced_request(
-        cwd,
+        &cwd,
         vec!["src".into()],
         vec![protected.to_string_lossy().into_owned()],
     );
@@ -811,7 +812,7 @@ async fn fence_escape_latch_single_cancel_and_event() {
         Reply::unary(&proto::CancelRunResponse {}),
     );
     let mut req = fenced_request(
-        cwd,
+        &cwd,
         vec!["src".into()],
         vec![protected.to_string_lossy().into_owned()],
     );
@@ -859,7 +860,7 @@ async fn protected_root_change_bounces() {
     );
 
     let req = fenced_request(
-        cwd,
+        &cwd,
         vec!["mirror.txt".into()],
         vec![protected.to_string_lossy().into_owned()],
     );
@@ -963,7 +964,7 @@ async fn protected_root_midrun_external_edit_notices_once() {
     bridge.expect("SdkAgentService/Send", Reply::StreamTimed(timed));
 
     let mut req = fenced_request(
-        cwd.clone(),
+        &cwd,
         vec!["mirror.txt".into()],
         vec![protected.to_string_lossy().into_owned()],
     );
@@ -1053,7 +1054,7 @@ async fn protected_root_external_then_agent_copy_escapes() {
     bridge.expect("SdkAgentService/Send", Reply::StreamTimed(timed));
 
     let mut req = fenced_request(
-        cwd.clone(),
+        &cwd,
         vec!["mirror.txt".into()],
         vec![protected.to_string_lossy().into_owned()],
     );
@@ -1133,7 +1134,7 @@ async fn protected_root_post_drive_external_only() {
     );
 
     let req = fenced_request(
-        cwd,
+        &cwd,
         vec!["mirror.txt".into()],
         vec![protected.to_string_lossy().into_owned()],
     );
@@ -1228,7 +1229,7 @@ async fn out_of_fence_git_drift_gets_one_correction_then_fails() {
         ),
     );
 
-    let req = fenced_request(cwd, vec!["in_fence.txt".into()], vec![]);
+    let req = fenced_request(&cwd, vec!["in_fence.txt".into()], vec![]);
     let (events, result) = collect(&bridge, req).await;
 
     assert!(events.iter().any(|event| matches!(
@@ -1279,7 +1280,7 @@ async fn in_fence_git_change_stays_ok() {
         ]),
     );
 
-    let req = fenced_request(cwd, vec!["allowed.txt".into()], vec![]);
+    let req = fenced_request(&cwd, vec!["allowed.txt".into()], vec![]);
     let (_, result) = collect(&bridge, req).await;
 
     assert_eq!(result.outcome, Outcome::Ok);
@@ -1322,7 +1323,7 @@ async fn dotdot_edit_outside_newfile_bounces_and_cancels() {
         "SdkAgentService/CancelRun",
         Reply::unary(&proto::CancelRunResponse {}),
     );
-    let (_, result) = collect(&bridge, fenced_request(cwd, vec!["src".into()], vec![])).await;
+    let (_, result) = collect(&bridge, fenced_request(&cwd, vec!["src".into()], vec![])).await;
     assert_eq!(result.outcome, Outcome::Bounced);
     assert_eq!(result.error_kind.as_deref(), Some("FenceEscape"));
 }
@@ -1362,7 +1363,7 @@ async fn edit_under_symlink_outside_bounces() {
         "SdkAgentService/CancelRun",
         Reply::unary(&proto::CancelRunResponse {}),
     );
-    let (_, result) = collect(&bridge, fenced_request(cwd, vec!["src".into()], vec![])).await;
+    let (_, result) = collect(&bridge, fenced_request(&cwd, vec!["src".into()], vec![])).await;
     assert_eq!(result.error_kind.as_deref(), Some("FenceEscape"));
 }
 
@@ -1429,7 +1430,7 @@ async fn attach_resume_drift_correction_then_fence_drift() {
         ),
     );
 
-    let mut req = fenced_request(cwd, vec!["in_fence.txt".into()], vec![]);
+    let mut req = fenced_request(&cwd, vec!["in_fence.txt".into()], vec![]);
     req.request_id = "pkt-resume:1".into();
     req.session_dir = Some(session_dir.to_string_lossy().into_owned());
 
@@ -1497,7 +1498,7 @@ async fn protected_root_git_failure_post_drive_emits_undecided() {
     );
 
     let req = fenced_request(
-        cwd,
+        &cwd,
         vec!["mirror.txt".into()],
         vec![protected.to_string_lossy().into_owned()],
     );
@@ -1579,7 +1580,7 @@ async fn attach_protected_baseline_only_reports_post_attach_changes() {
     );
 
     let mut req = fenced_request(
-        cwd,
+        &cwd,
         vec!["mirror.txt".into()],
         vec![protected.to_string_lossy().into_owned()],
     );

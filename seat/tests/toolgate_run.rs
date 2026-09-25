@@ -18,7 +18,7 @@ use std::fs;
 use support::*;
 use tokio::sync::mpsc;
 
-fn base_request(cwd: std::path::PathBuf, toolgate: ToolgateConfig) -> SeatRequest {
+fn base_request(cwd: &std::path::Path, toolgate: ToolgateConfig) -> SeatRequest {
     SeatRequest {
         v: 1,
         request_id: "pkt-tg:1".into(),
@@ -116,7 +116,7 @@ async fn off_registers_no_toolgate_tools() {
         "SdkAgentService/GetUsage",
         Reply::unary(&proto::GetUsageResponse::default()),
     );
-    let req = base_request(cwd, ToolgateConfig::default());
+    let req = base_request(&cwd, ToolgateConfig::default());
     collect(&bridge, req).await;
     let create: proto::CreateAgentRequest = bridge.request("SdkAgentService/CreateAgent");
     let keys: Vec<String> = create
@@ -143,7 +143,7 @@ async fn replace_disallows_builtin_read_edit_write_shell() {
         Reply::unary(&proto::GetUsageResponse::default()),
     );
     let req = base_request(
-        cwd,
+        &cwd,
         ToolgateConfig {
             mode: ToolgateMode::Replace,
             gates: vec![],
@@ -171,7 +171,7 @@ async fn add_declares_toolgate_custom_tools() {
         Reply::unary(&proto::GetUsageResponse::default()),
     );
     let req = base_request(
-        cwd,
+        &cwd,
         ToolgateConfig {
             mode: ToolgateMode::Add,
             gates: vec![],
@@ -190,7 +190,7 @@ async fn read_window_round_trips() {
     let cwd = workspace_dir();
     fs::write(cwd.join("sample.txt"), "line1\nline2\n").unwrap();
     let ctx = ToolgateContext {
-        cwd: cwd.clone(),
+        cwd: cwd.to_path_buf(),
         fence: vec![],
         gates: vec![],
         allowed_extra: vec![],
@@ -210,7 +210,7 @@ async fn read_window_round_trips() {
 async fn run_bounded_round_trips() {
     let cwd = workspace_dir();
     let ctx = ToolgateContext {
-        cwd: cwd.clone(),
+        cwd: cwd.to_path_buf(),
         fence: vec![],
         gates: vec![],
         allowed_extra: vec![],
@@ -268,7 +268,7 @@ async fn tool_stats_count_completed_tool_calls() {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let run_fut = run_seat(
         &client,
-        base_request(cwd, ToolgateConfig::default()),
+        base_request(&cwd, ToolgateConfig::default()),
         inbox,
         tx,
         None,
@@ -306,7 +306,7 @@ async fn edit_diff_outside_fence_is_rejected() {
     fs::write(cwd.join("allowed.txt"), b"a").unwrap();
     fs::write(cwd.join("outside.txt"), b"a").unwrap();
     let ctx = ToolgateContext {
-        cwd: cwd.clone(),
+        cwd: cwd.to_path_buf(),
         fence: vec!["allowed.txt".into()],
         gates: vec![],
         allowed_extra: vec![],
@@ -332,11 +332,11 @@ async fn run_bounded_into_protected_root_returns_error_before_run() {
     fs::write(&src, b"x").unwrap();
     let target = protected.join("crates/evil.rs");
     let ctx = ToolgateContext {
-        cwd: cwd.clone(),
+        cwd: cwd.to_path_buf(),
         fence: vec![".".into()],
         gates: vec![],
         allowed_extra: vec![],
-        protected_roots: vec![protected.clone()],
+        protected_roots: vec![protected.to_path_buf()],
     };
     let out = invoke_tool_blocking(
         &ctx,
@@ -407,7 +407,7 @@ async fn replace_falls_back_only_when_create_agent_rejects_disallowed_tool() {
         Reply::unary(&proto::GetUsageResponse::default()),
     );
     let mut req = base_request(
-        cwd,
+        &cwd,
         ToolgateConfig {
             mode: ToolgateMode::Replace,
             gates: vec![],
@@ -452,7 +452,7 @@ async fn replace_does_not_fallback_on_unrelated_create_agent_error() {
         ),
     );
     let req = base_request(
-        cwd,
+        &cwd,
         ToolgateConfig {
             mode: ToolgateMode::Replace,
             gates: vec![],
@@ -533,7 +533,7 @@ async fn tool_stats_counts_custom_tool_callback_wire_size() {
     let run_fut = run_seat(
         &client,
         base_request(
-            cwd,
+            &cwd,
             ToolgateConfig {
                 mode: ToolgateMode::Add,
                 gates: vec![],
