@@ -17,15 +17,17 @@ use serde_json::json;
 use support::*;
 use tokio::sync::mpsc;
 
-fn request_with(body: &str, effort: Option<&str>, timeout_s: u64) -> SeatRequest {
-    request_with_cwd(body, effort, timeout_s, workspace_dir())
+fn request_with(body: &str, effort: Option<&str>, timeout_s: u64) -> (TestDir, SeatRequest) {
+    let cwd = workspace_dir();
+    let req = request_with_cwd(body, effort, timeout_s, &cwd);
+    (cwd, req)
 }
 
 fn request_with_cwd(
     body: &str,
     effort: Option<&str>,
     timeout_s: u64,
-    cwd: std::path::PathBuf,
+    cwd: &std::path::Path,
 ) -> SeatRequest {
     SeatRequest {
         v: 1,
@@ -242,12 +244,8 @@ async fn happy_path_streams_events_and_captures_usage() {
     script_usage(&bridge);
     script_close(&bridge);
 
-    let (events, result) = collect(
-        &bridge,
-        request_with("the body", Some("high"), 600),
-        Inbox::new(&[]).unwrap(),
-    )
-    .await;
+    let (_cwd, req) = request_with("the body", Some("high"), 600);
+    let (events, result) = collect(&bridge, req, Inbox::new(&[]).unwrap()).await;
 
     assert_eq!(
         event_types(&events),
@@ -325,7 +323,8 @@ async fn hard_cancel_before_run_id_fires_on_run_started() {
         })
         .unwrap();
 
-    let (_, result) = collect(&bridge, request_with("b", Some("high"), 600), inbox).await;
+    let (_cwd, req) = request_with("b", Some("high"), 600);
+    let (_, result) = collect(&bridge, req, inbox).await;
 
     assert_eq!(bridge.call_count("SdkAgentService/CancelRun"), 1);
     let cancel: proto::CancelRunRequest = bridge.request("SdkAgentService/CancelRun");
@@ -380,12 +379,8 @@ async fn dropped_stream_resumes_without_replaying_events() {
     script_usage(&bridge);
     script_close(&bridge);
 
-    let (events, result) = collect(
-        &bridge,
-        request_with("b", Some("high"), 600),
-        Inbox::new(&[]).unwrap(),
-    )
-    .await;
+    let (_cwd, req) = request_with("b", Some("high"), 600);
+    let (events, result) = collect(&bridge, req, Inbox::new(&[]).unwrap()).await;
 
     assert!(result.resumed);
     assert_eq!(result.outcome, Outcome::Ok);
@@ -425,12 +420,8 @@ async fn busy_create_is_terminal_without_a_send() {
     );
     script_close(&bridge);
 
-    let (_, result) = collect(
-        &bridge,
-        request_with("b", Some("high"), 600),
-        Inbox::new(&[]).unwrap(),
-    )
-    .await;
+    let (_cwd, req) = request_with("b", Some("high"), 600);
+    let (_, result) = collect(&bridge, req, Inbox::new(&[]).unwrap()).await;
 
     assert_eq!(result.outcome, Outcome::Busy);
     assert_eq!(result.error_kind.as_deref(), Some("AgentBusy"));
@@ -458,12 +449,8 @@ async fn transient_create_retries_on_the_same_attempt() {
     script_usage(&bridge);
     script_close(&bridge);
 
-    let (_, result) = collect(
-        &bridge,
-        request_with("b", Some("high"), 600),
-        Inbox::new(&[]).unwrap(),
-    )
-    .await;
+    let (_cwd, req) = request_with("b", Some("high"), 600);
+    let (_, result) = collect(&bridge, req, Inbox::new(&[]).unwrap()).await;
 
     // models(1) + create fail(2) + create ok(3) + send(4).
     assert_eq!(result.outcome, Outcome::Ok);
@@ -480,12 +467,8 @@ async fn unknown_model_bounces_before_any_agent_call() {
     );
     script_close(&bridge);
 
-    let (_, result) = collect(
-        &bridge,
-        request_with("b", Some("high"), 600),
-        Inbox::new(&[]).unwrap(),
-    )
-    .await;
+    let (_cwd, req) = request_with("b", Some("high"), 600);
+    let (_, result) = collect(&bridge, req, Inbox::new(&[]).unwrap()).await;
 
     assert_eq!(result.outcome, Outcome::Bounced);
     assert_eq!(result.attempts, 1);
@@ -499,12 +482,8 @@ async fn effort_outside_the_catalog_bounces() {
     script_close(&bridge);
 
     // "medium" is not among the catalog values (low, high).
-    let (_, result) = collect(
-        &bridge,
-        request_with("b", Some("medium"), 600),
-        Inbox::new(&[]).unwrap(),
-    )
-    .await;
+    let (_cwd, req) = request_with("b", Some("medium"), 600);
+    let (_, result) = collect(&bridge, req, Inbox::new(&[]).unwrap()).await;
 
     assert_eq!(result.outcome, Outcome::Bounced);
     assert_eq!(bridge.call_count("SdkAgentService/CreateAgent"), 0);
@@ -548,12 +527,8 @@ async fn skipped_effort_sends_fast_only() {
     script_close(&bridge);
 
     // "n/a" (what the drain sends for composer) skips the effort param.
-    let (_, result) = collect(
-        &bridge,
-        request_with("b", Some("n/a"), 600),
-        Inbox::new(&[]).unwrap(),
-    )
-    .await;
+    let (_cwd, req) = request_with("b", Some("n/a"), 600);
+    let (_, result) = collect(&bridge, req, Inbox::new(&[]).unwrap()).await;
 
     assert_eq!(result.outcome, Outcome::Ok);
     let create: proto::CreateAgentRequest = bridge.request("SdkAgentService/CreateAgent");
@@ -579,12 +554,8 @@ async fn non_skip_effort_without_catalog_param_bounces() {
     );
     script_close(&bridge);
 
-    let (_, result) = collect(
-        &bridge,
-        request_with("b", Some("high"), 600),
-        Inbox::new(&[]).unwrap(),
-    )
-    .await;
+    let (_cwd, req) = request_with("b", Some("high"), 600);
+    let (_, result) = collect(&bridge, req, Inbox::new(&[]).unwrap()).await;
 
     assert_eq!(result.outcome, Outcome::Bounced);
     assert_eq!(bridge.call_count("SdkAgentService/CreateAgent"), 0);
@@ -599,13 +570,12 @@ async fn full_text_is_archived_when_a_session_dir_is_given() {
     script_usage(&bridge);
     script_close(&bridge);
 
-    let dir = std::env::temp_dir().join(format!("seat-run-{}", std::process::id()));
-    let mut request = request_with("b", Some("high"), 600);
-    request.session_dir = Some(dir.display().to_string());
+    let dir = workspace_dir();
+    let (_cwd, mut request) = request_with("b", Some("high"), 600);
+    request.session_dir = Some(dir.to_string_lossy().into_owned());
 
     let (_, result) = collect(&bridge, request, Inbox::new(&[]).unwrap()).await;
 
     let path = result.archive_path.expect("archive path");
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "Hello, world.");
-    std::fs::remove_dir_all(&dir).unwrap();
 }

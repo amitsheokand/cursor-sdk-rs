@@ -468,11 +468,11 @@ fn epoch_secs() -> u64 {
 mod tests {
     use super::*;
     use crate::protocol::Outcome;
+    use crate::test_dir::TestDir;
 
-    fn tempdir(name: &str) -> PathBuf {
+    fn tempdir(name: &str) -> TestDir {
         let dir = std::env::temp_dir().join(format!("seat-session-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        dir
+        TestDir::hold(dir)
     }
 
     fn failed_result() -> SeatResult {
@@ -508,7 +508,6 @@ mod tests {
         let raw = std::fs::read_to_string(dir.join(SESSION_FILE)).unwrap();
         assert!(raw.ends_with('\n'));
         assert_eq!(raw.lines().count(), 1);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -530,7 +529,6 @@ mod tests {
             store.resume_target().unwrap(),
             ("run_1".to_string(), "agent_1".to_string())
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -549,7 +547,6 @@ mod tests {
                 agent_id: "agent_9".into(),
             }
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -580,7 +577,6 @@ mod tests {
         let raw = std::fs::read_to_string(dir.join(SESSION_FILE)).unwrap();
         assert!(raw.ends_with('\n'));
         assert!(!raw.contains("seq\":99"));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -604,7 +600,6 @@ mod tests {
             SessionStore::open(&dir, "pkt:1"),
             Err(SessionError::Corrupt(_))
         ));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -617,7 +612,6 @@ mod tests {
         assert!(store.set_state(OpState::Awaiting).is_err());
         store.set_state(OpState::Canceled).unwrap();
         assert!(store.set_state(OpState::Failed).is_err());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -630,6 +624,5 @@ mod tests {
             SessionStore::open(&dir, "pkt:1"),
             Err(SessionError::Unresumable(_))
         ));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

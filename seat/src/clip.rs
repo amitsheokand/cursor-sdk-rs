@@ -369,11 +369,11 @@ mod tests {
 
     #[test]
     fn archive_writes_bytes_and_hashes_them() {
-        let dir = std::env::temp_dir().join(format!("seat-clip-{}", std::process::id()));
+        use crate::test_dir::TestDir;
+        let dir = TestDir::fresh_in_temp("seat-clip", std::process::id() as u64);
         let result = archive_text("héllo", &dir, "sub", "sess", "out.txt").expect("archive");
         assert_eq!(result.bytes, "héllo".len() as u64);
         assert_eq!(result.sha256, sha256_text("héllo"));
         assert_eq!(std::fs::read(&result.path).unwrap(), "héllo".as_bytes());
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

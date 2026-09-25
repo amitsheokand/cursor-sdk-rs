@@ -7,7 +7,6 @@ mod support;
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
@@ -132,10 +131,11 @@ async fn mock_server(
     url
 }
 
-fn questions_dir() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("seat-jev-e2e-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+fn questions_dir() -> TestDir {
+    let path = std::env::temp_dir().join(format!("seat-jev-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&path);
+    std::fs::create_dir_all(&path).unwrap();
+    let dir = TestDir::from_existing(path);
     std::fs::write(
         dir.join("post.toml"),
         "[question.receipt_supported]\n\
@@ -156,11 +156,11 @@ fn questions_dir() -> PathBuf {
     dir
 }
 
-fn request_with_jev(dir: &PathBuf, turns: u32) -> SeatRequest {
+fn request_with_jev(questions: &std::path::Path, cwd: &std::path::Path, turns: u32) -> SeatRequest {
     SeatRequest {
         v: 1,
         request_id: "pkt-6:1".into(),
-        cwd: workspace_dir().to_string_lossy().into_owned(),
+        cwd: cwd.to_string_lossy().into_owned(),
         model: ModelRef {
             id: "composer-2.5".into(),
             params: ModelParams {
@@ -181,7 +181,7 @@ fn request_with_jev(dir: &PathBuf, turns: u32) -> SeatRequest {
         toolgate: Default::default(),
         jev: JevConfig {
             enabled: true,
-            questions_dir: Some(dir.display().to_string()),
+            questions_dir: Some(questions.display().to_string()),
             self_check_turns: turns,
             prune_tools: false,
         },
@@ -301,6 +301,7 @@ async fn self_check_and_triage_flow() {
     let url = mock_server(p.clone(), saw_auth.clone(), saw_model.clone()).await;
     let _env = EnvGuard::set(&url);
     let dir = questions_dir();
+    let ws = workspace_dir();
 
     // Scenario A: passing self-check, no follow-up.
     let bridge = FakeBridge::start().await;
@@ -326,7 +327,7 @@ async fn self_check_and_triage_flow() {
         "SdkAgentService/CloseAgent",
         Reply::unary(&proto::CloseAgentResponse {}),
     );
-    let (events, result) = collect(&bridge, request_with_jev(&dir, 1)).await;
+    let (events, result) = collect(&bridge, request_with_jev(&dir, &ws, 1)).await;
     assert_eq!(result.outcome, Outcome::Ok);
     let check = result.self_check.expect("self_check recorded");
     assert!(check.passed);
@@ -367,7 +368,7 @@ async fn self_check_and_triage_flow() {
         "SdkAgentService/CloseAgent",
         Reply::unary(&proto::CloseAgentResponse {}),
     );
-    let (_, result) = collect(&bridge, request_with_jev(&dir, 1)).await;
+    let (_, result) = collect(&bridge, request_with_jev(&dir, &ws, 1)).await;
     assert_eq!(result.outcome, Outcome::Ok);
     assert_eq!(result.text, "second");
     let check = result.self_check.expect("self_check recorded");
@@ -410,7 +411,7 @@ async fn self_check_and_triage_flow() {
         "SdkAgentService/CloseAgent",
         Reply::unary(&proto::CloseAgentResponse {}),
     );
-    let (events, result) = collect(&bridge, request_with_jev(&dir, 0)).await;
+    let (events, result) = collect(&bridge, request_with_jev(&dir, &ws, 0)).await;
     assert_eq!(result.error_kind.as_deref(), Some("Unknown"));
     let triage = events.iter().find_map(|e| match &e.kind {
         SeatEventKind::Jev { check, verdict, p } => Some((check.clone(), verdict.clone(), *p)),
@@ -422,9 +423,11 @@ async fn self_check_and_triage_flow() {
     );
 
     // Scenario D: trivial task skips the self-check loop (one Send).
-    let trivial_dir = std::env::temp_dir().join(format!("seat-jev-trivial-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&trivial_dir);
-    std::fs::create_dir_all(&trivial_dir).unwrap();
+    let trivial_path =
+        std::env::temp_dir().join(format!("seat-jev-trivial-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&trivial_path);
+    std::fs::create_dir_all(&trivial_path).unwrap();
+    let trivial_dir = TestDir::from_existing(trivial_path);
     std::fs::write(
         trivial_dir.join("post.toml"),
         "[question.receipt_supported]\n\
@@ -466,15 +469,16 @@ async fn self_check_and_triage_flow() {
         "SdkAgentService/CloseAgent",
         Reply::unary(&proto::CloseAgentResponse {}),
     );
-    let (_events, result) = collect(&bridge, request_with_jev(&trivial_dir, 1)).await;
+    let (_events, result) = collect(&bridge, request_with_jev(&trivial_dir, &ws, 1)).await;
     assert_eq!(result.outcome, Outcome::Ok);
     assert_eq!(result.self_check, None);
     assert_eq!(bridge.call_count("SdkAgentService/Send"), 1);
 
     // Scenario E: prune_tools declares only the kept tool.
-    let prune_dir = std::env::temp_dir().join(format!("seat-jev-prune-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&prune_dir);
-    std::fs::create_dir_all(&prune_dir).unwrap();
+    let prune_path = std::env::temp_dir().join(format!("seat-jev-prune-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&prune_path);
+    std::fs::create_dir_all(&prune_path).unwrap();
+    let prune_dir = TestDir::from_existing(prune_path);
     std::fs::write(
         prune_dir.join("tools.toml"),
         "[question.select_tools]\n\
@@ -507,7 +511,7 @@ async fn self_check_and_triage_flow() {
         "SdkAgentService/CloseAgent",
         Reply::unary(&proto::CloseAgentResponse {}),
     );
-    let mut pruned = request_with_jev(&prune_dir, 0);
+    let mut pruned = request_with_jev(&prune_dir, &ws, 0);
     pruned.jev.prune_tools = true;
     let (events, result) = collect(&bridge, pruned).await;
     assert_eq!(result.outcome, Outcome::Ok);
@@ -530,8 +534,4 @@ async fn self_check_and_triage_flow() {
         _ => None,
     });
     assert_eq!(prune_event.as_deref(), Some("skill_use"));
-
-    let _ = std::fs::remove_dir_all(&dir);
-    let _ = std::fs::remove_dir_all(&trivial_dir);
-    let _ = std::fs::remove_dir_all(&prune_dir);
 }

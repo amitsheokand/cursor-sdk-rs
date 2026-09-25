@@ -1283,18 +1283,16 @@ pub fn tool_args_from_message(message: &StreamMessage) -> (String, serde_json::M
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_dir::TestDir;
     use std::fs;
     use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-    fn unique_temp(prefix: &str) -> PathBuf {
+    fn unique_temp(prefix: &str) -> TestDir {
         let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("{prefix}-{}-{n}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).expect("temp dir");
-        dir
+        TestDir::fresh_in_temp(prefix, n)
     }
 
     #[test]
@@ -1310,12 +1308,7 @@ mod tests {
     fn tilde_fence_entry_under_cwd_matches() {
         let home = PathBuf::from(std::env::var("HOME").expect("HOME"));
         let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let cwd = home.join(format!(
-            ".cursor-seat-fence-tilde-{}-{n}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&cwd);
-        fs::create_dir_all(&cwd).unwrap();
+        let cwd = TestDir::fresh_under_home(".cursor-seat-fence-tilde", n);
         let file_rel = "marked.txt";
         fs::write(cwd.join(file_rel), b"x").unwrap();
         let rel_from_home = cwd.strip_prefix(&home).expect("cwd under HOME");
@@ -1416,9 +1409,9 @@ mod tests {
         let dir = unique_temp("fence-snap");
         let file = dir.join("tracked.txt");
         fs::write(&file, b"a").unwrap();
-        let before = snapshot(&[dir.clone()], &["tracked.txt".into()], &dir);
+        let before = snapshot(&[dir.to_path_buf()], &["tracked.txt".into()], &dir);
         fs::write(&file, b"ab").unwrap();
-        let after = snapshot(&[dir.clone()], &["tracked.txt".into()], &dir);
+        let after = snapshot(&[dir.to_path_buf()], &["tracked.txt".into()], &dir);
         let delta = changed(&before, &after);
         assert_eq!(delta, vec![file]);
     }
@@ -1431,7 +1424,7 @@ mod tests {
         fs::write(root.join("f.txt"), b"old").unwrap();
         git_commit_all(&root, "base");
         fs::write(wt.join("f.txt"), b"same").unwrap();
-        let roots = vec![root.clone()];
+        let roots = vec![root.to_path_buf()];
         let before = snapshot(&roots, &["f.txt".into()], &wt);
         fs::write(root.join("f.txt"), b"same").unwrap();
         let after = snapshot(&roots, &["f.txt".into()], &wt);
@@ -1452,7 +1445,7 @@ mod tests {
         fs::write(root.join("f.txt"), b"head").unwrap();
         git_commit_all(&root, "base");
         fs::write(root.join("f.txt"), b"dirty").unwrap();
-        let roots = vec![root.clone()];
+        let roots = vec![root.to_path_buf()];
         let before = snapshot(&roots, &["f.txt".into()], &wt);
         fs::write(root.join("f.txt"), b"head").unwrap();
         Command::new("git")
@@ -1475,7 +1468,7 @@ mod tests {
         fs::write(wt.join("f.txt"), b"same").unwrap();
         fs::write(root.join("f.txt"), b"old").unwrap();
         git_commit_all(&root, "base");
-        let roots = vec![root.clone()];
+        let roots = vec![root.to_path_buf()];
         let before = snapshot(&roots, &["f.txt".into()], &wt);
         fs::write(root.join("f.txt"), b"same").unwrap();
         git_commit_all(&root, "owner");
@@ -1498,7 +1491,7 @@ mod tests {
         git_commit_all(&wt, "agent");
         fs::write(root.join("f.txt"), b"base").unwrap();
         git_commit_all(&root, "base");
-        let roots = vec![root.clone()];
+        let roots = vec![root.to_path_buf()];
         let before = snapshot(&roots, &["f.txt".into()], &wt);
         fs::write(root.join("f.txt"), b"agent").unwrap();
         let after = snapshot(&roots, &["f.txt".into()], &wt);
@@ -1516,7 +1509,7 @@ mod tests {
         fs::write(root.join("README.md"), b"init").unwrap();
         git_commit_all(&root, "empty");
         fs::write(wt.join("f.txt"), b"new-agent").unwrap();
-        let roots = vec![root.clone()];
+        let roots = vec![root.to_path_buf()];
         let before = snapshot(&roots, &["f.txt".into()], &wt);
         fs::write(root.join("f.txt"), b"new-agent").unwrap();
         let after = snapshot(&roots, &["f.txt".into()], &wt);
@@ -1532,7 +1525,7 @@ mod tests {
         let root = unique_temp("attr-root-nogit");
         fs::write(wt.join("f.txt"), b"same").unwrap();
         fs::write(root.join("f.txt"), b"old").unwrap();
-        let roots = vec![root.clone()];
+        let roots = vec![root.to_path_buf()];
         let before = snapshot(&roots, &["f.txt".into()], &wt);
         fs::write(root.join("f.txt"), b"same").unwrap();
         let after = snapshot(&roots, &["f.txt".into()], &wt);
@@ -1562,7 +1555,7 @@ mod tests {
             .expect("git commit");
         let wt = unique_temp("attr-nested-wt");
         fs::write(wt.join("f.txt"), b"agent").unwrap();
-        let roots = vec![root.clone()];
+        let roots = vec![root.to_path_buf()];
         let before = snapshot(&roots, &["f.txt".into()], &wt);
         fs::write(root.join("f.txt"), b"agent").unwrap();
         let after = snapshot(&roots, &["f.txt".into()], &wt);
@@ -1591,7 +1584,7 @@ mod tests {
             .expect("git commit");
         let wt = unique_temp("attr-nested-wt-owner");
         fs::write(wt.join("f.txt"), b"head").unwrap();
-        let roots = vec![root.clone()];
+        let roots = vec![root.to_path_buf()];
         let before = snapshot(&roots, &["f.txt".into()], &wt);
         fs::write(root.join("f.txt"), b"owner-edit").unwrap();
         let after = snapshot(&roots, &["f.txt".into()], &wt);
@@ -1610,7 +1603,7 @@ mod tests {
         fs::write(wt.join(name), b"agent").unwrap();
         fs::write(root.join(name), b"old").unwrap();
         git_commit_all(&root, "base");
-        let roots = vec![root.clone()];
+        let roots = vec![root.to_path_buf()];
         let before = snapshot(&roots, &[name.into()], &wt);
         fs::write(root.join(name), b"agent").unwrap();
         let after = snapshot(&roots, &[name.into()], &wt);
@@ -1628,7 +1621,7 @@ mod tests {
         fs::write(root.join("f.txt"), b"x").unwrap();
         git_commit_all(&root, "base");
         fs::write(wt.join("f.txt"), b"x").unwrap();
-        let roots = vec![root.clone()];
+        let roots = vec![root.to_path_buf()];
         let before = snapshot(&roots, &["f.txt".into()], &wt);
         fs::rename(root.join("f.txt"), root.join("g.txt")).unwrap();
         let after = snapshot(&roots, &["f.txt".into(), "g.txt".into()], &wt);
@@ -1644,7 +1637,7 @@ mod tests {
         let root = unique_temp("attr-root-diff");
         fs::write(wt.join("f.txt"), b"wt").unwrap();
         fs::write(root.join("f.txt"), b"old").unwrap();
-        let roots = vec![root.clone()];
+        let roots = vec![root.to_path_buf()];
         let before = snapshot(&roots, &["f.txt".into()], &wt);
         fs::write(root.join("f.txt"), b"owner").unwrap();
         let after = snapshot(&roots, &["f.txt".into()], &wt);
@@ -1659,7 +1652,7 @@ mod tests {
         let wt = unique_temp("attr-wt-miss");
         let root = unique_temp("attr-root-miss");
         fs::write(root.join("f.txt"), b"old").unwrap();
-        let roots = vec![root.clone()];
+        let roots = vec![root.to_path_buf()];
         let before = snapshot(&roots, &["f.txt".into()], &wt);
         fs::write(root.join("f.txt"), b"new").unwrap();
         let after = snapshot(&roots, &["f.txt".into()], &wt);
@@ -1675,7 +1668,7 @@ mod tests {
         let root = unique_temp("attr-root-del");
         fs::write(wt.join("f.txt"), b"x").unwrap();
         fs::write(root.join("f.txt"), b"x").unwrap();
-        let roots = vec![root.clone()];
+        let roots = vec![root.to_path_buf()];
         let before = snapshot(&roots, &["f.txt".into()], &wt);
         fs::remove_file(root.join("f.txt")).unwrap();
         let after = snapshot(&roots, &["f.txt".into()], &wt);
@@ -1693,7 +1686,7 @@ mod tests {
         let root = unique_temp("attr-root-link");
         fs::write(wt.join("f.txt"), b"x").unwrap();
         fs::write(root.join("f.txt"), b"x").unwrap();
-        let roots = vec![root.clone()];
+        let roots = vec![root.to_path_buf()];
         let before = snapshot(&roots, &["f.txt".into()], &wt);
         fs::remove_file(root.join("f.txt")).unwrap();
         symlink(wt.join("f.txt"), root.join("f.txt")).unwrap();
@@ -1877,14 +1870,14 @@ mod tests {
         fs::write(fenced.join("target/lib.rlib"), b"2").unwrap();
         fs::write(fenced.join("node_modules/x.js"), b"3").unwrap();
         fs::write(fenced.join("ok.txt"), b"ok").unwrap();
-        let before = snapshot(&[root.clone()], &["pkg".into()], &root);
+        let before = snapshot(&[root.to_path_buf()], &["pkg".into()], &root);
         fs::write(fenced.join(".git/config"), b"changed").unwrap();
         fs::write(fenced.join("target/lib.rlib"), b"changed").unwrap();
         fs::write(fenced.join("node_modules/x.js"), b"changed").unwrap();
-        let after = snapshot(&[root.clone()], &["pkg".into()], &root);
+        let after = snapshot(&[root.to_path_buf()], &["pkg".into()], &root);
         assert!(changed(&before, &after).is_empty());
         fs::write(fenced.join("ok.txt"), b"changed").unwrap();
-        let after2 = snapshot(&[root.clone()], &["pkg".into()], &root);
+        let after2 = snapshot(&[root.to_path_buf()], &["pkg".into()], &root);
         assert_eq!(changed(&after, &after2), vec![fenced.join("ok.txt")]);
     }
 
@@ -1898,12 +1891,12 @@ mod tests {
         let outside = unique_temp("fence-snap-link-out");
         fs::write(outside.join("secret.txt"), b"s").unwrap();
         symlink(&outside, fenced.join("linkdir")).unwrap();
-        let before = snapshot(&[root.clone()], &["tree".into()], &root);
+        let before = snapshot(&[root.to_path_buf()], &["tree".into()], &root);
         let other = unique_temp("fence-snap-link-other");
         fs::create_dir_all(&other).unwrap();
         fs::remove_file(fenced.join("linkdir")).unwrap();
         symlink(&other, fenced.join("linkdir")).unwrap();
-        let after = snapshot(&[root.clone()], &["tree".into()], &root);
+        let after = snapshot(&[root.to_path_buf()], &["tree".into()], &root);
         assert_eq!(changed(&before, &after), vec![fenced.join("linkdir")]);
     }
 
@@ -1912,13 +1905,13 @@ mod tests {
         let dir = unique_temp("fence-snap-mtime");
         let file = dir.join("tracked.txt");
         fs::write(&file, b"same").unwrap();
-        let before = snapshot(&[dir.clone()], &["tracked.txt".into()], &dir);
+        let before = snapshot(&[dir.to_path_buf()], &["tracked.txt".into()], &dir);
         fs::write(&file, b"same").unwrap();
         std::process::Command::new("touch")
             .arg(&file)
             .status()
             .expect("touch");
-        let after = snapshot(&[dir.clone()], &["tracked.txt".into()], &dir);
+        let after = snapshot(&[dir.to_path_buf()], &["tracked.txt".into()], &dir);
         assert!(changed(&before, &after).is_empty());
     }
 
@@ -1929,15 +1922,16 @@ mod tests {
             .clone()
     }
 
-    fn shell_hit(command: &str, cwd: &Path, protected: &[PathBuf]) -> Option<PathBuf> {
-        tool_escape("shell", &shell_args(command), cwd, &[], protected)
+    fn shell_hit(command: &str, cwd: &Path, protected: &[impl AsRef<Path>]) -> Option<PathBuf> {
+        let roots: Vec<PathBuf> = protected.iter().map(|p| p.as_ref().to_path_buf()).collect();
+        tool_escape("shell", &shell_args(command), cwd, &[], &roots)
     }
 
     fn run_bounded_hit(
         program: &str,
         args: &[&str],
         cwd: &Path,
-        protected: &[PathBuf],
+        protected: &[impl AsRef<Path>],
     ) -> Option<PathBuf> {
         let argv: Vec<Value> = args
             .iter()
@@ -1947,7 +1941,8 @@ mod tests {
             .as_object()
             .unwrap()
             .clone();
-        tool_escape("run_bounded", &map, cwd, &[], protected)
+        let roots: Vec<PathBuf> = protected.iter().map(|p| p.as_ref().to_path_buf()).collect();
+        tool_escape("run_bounded", &map, cwd, &[], &roots)
     }
 
     #[test]
@@ -1981,7 +1976,7 @@ mod tests {
             src.display(),
             main.join("crates/foo/src/dde_lparam.rs").display()
         );
-        assert!(shell_hit(&cmd, &cwd, &[main.clone()]).is_some());
+        assert!(shell_hit(&cmd, &cwd, &[main.to_path_buf()]).is_some());
     }
 
     #[test]
@@ -2024,20 +2019,16 @@ mod tests {
     fn shell_command_home_spelling_variants() {
         let home = PathBuf::from(std::env::var("HOME").expect("HOME"));
         let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let main = home.join(format!(
-            "cursor-seat-shell-home-main-{}-{n}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&main);
-        fs::create_dir_all(&main).unwrap();
+        let main = TestDir::fresh_under_home("cursor-seat-shell-home-main", n);
         let cwd = unique_temp("shell-home-cwd");
         let rel = main.strip_prefix(&home).expect("under home");
+        let main_pb = main.to_path_buf();
         for cmd in [
             format!("cat ~/{}/secret", rel.to_string_lossy()),
             format!("cat $HOME/{}/secret", rel.to_string_lossy()),
             format!("cat ${{HOME}}/{}/secret", rel.to_string_lossy()),
         ] {
-            assert!(shell_hit(&cmd, &cwd, &[main.clone()]).is_some());
+            assert!(shell_hit(&cmd, &cwd, &[main_pb.clone()]).is_some());
         }
     }
 
@@ -2064,7 +2055,7 @@ mod tests {
     fn shell_command_allows_tmp_and_nix() {
         let cwd = unique_temp("shell-ok-cwd");
         let main = unique_temp("shell-ok-main");
-        assert!(shell_hit("cat /tmp/foo", &cwd, &[main.clone()]).is_none());
+        assert!(shell_hit("cat /tmp/foo", &cwd, &[main.to_path_buf()]).is_none());
         assert!(shell_hit("ls /nix/store/abc", &cwd, &[main]).is_none());
     }
 
@@ -2114,10 +2105,10 @@ mod tests {
         assert!(shell_hit(
             "CARGO_TARGET_DIR=../main/target cargo test",
             &wt,
-            &[main.clone()]
+            &[main.to_path_buf()]
         )
         .is_some());
-        assert!(shell_hit("cd ../main && git status", &wt, &[main.clone()]).is_some());
+        assert!(shell_hit("cd ../main && git status", &wt, &[main.to_path_buf()]).is_some());
         assert!(shell_hit("cat ../main/x", &wt, &[main]).is_some());
     }
 
@@ -2128,7 +2119,7 @@ mod tests {
         let wt = parent.join("wt");
         fs::create_dir_all(&main).unwrap();
         fs::create_dir_all(&wt).unwrap();
-        assert!(shell_hit("ln -sfn ../main/sdk sdk", &wt, &[main.clone()]).is_some());
+        assert!(shell_hit("ln -sfn ../main/sdk sdk", &wt, &[main.to_path_buf()]).is_some());
         assert!(shell_hit("cat sdk/secret.txt", &wt, &[main]).is_none());
     }
 
@@ -2167,7 +2158,7 @@ mod tests {
         assert!(shell_hit(
             "cd seat && cp ../../primary/file .",
             &wt,
-            &[primary.clone()]
+            &[primary.to_path_buf()]
         )
         .is_some());
         fs::write(wt.join("README.md"), b"r").unwrap();
